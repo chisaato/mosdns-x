@@ -130,3 +130,38 @@ func TestMatcher_Add(t *testing.T) {
 		t.Errorf("Expected length 1, got %d", m.Len())
 	}
 }
+func TestMatcher_CaseInsensitive(t *testing.T) {
+	m := NewMatcher()
+
+	// Add lowercase MAC with letters
+	err := m.Add("aa:bb:cc:dd:ee:ff", struct{}{})
+	if err != nil {
+		t.Fatalf("Failed to add MAC: %v", err)
+	}
+
+	// Parse uppercase MAC
+	upperMAC, err := net.ParseMAC("AA:BB:CC:DD:EE:FF")
+	if err != nil {
+		t.Fatalf("Failed to parse uppercase MAC: %v", err)
+	}
+
+	// Should match
+	if !m.Match(upperMAC) {
+		t.Error("Uppercase MAC should match lowercase stored MAC")
+	}
+
+	// Test mixed case
+	mixedMAC, err := net.ParseMAC("Aa:Bb:Cc:Dd:Ee:Ff")
+	if err != nil {
+		t.Fatalf("Failed to parse mixed MAC: %v", err)
+	}
+
+	if !m.Match(mixedMAC) {
+		t.Error("Mixed case MAC should match")
+	}
+
+	// Length should be 1
+	if m.Len() != 1 {
+		t.Errorf("Expected length 1, got %d", m.Len())
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
 	"github.com/pmkol/mosdns-x/pkg/matcher/domain"
 	"github.com/pmkol/mosdns-x/pkg/matcher/elem"
+	"github.com/pmkol/mosdns-x/pkg/matcher/macaddr"
 	"github.com/pmkol/mosdns-x/pkg/matcher/msg_matcher"
 	"github.com/pmkol/mosdns-x/pkg/matcher/netlist"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
@@ -64,11 +65,12 @@ func init() {
 var _ coremain.MatcherPlugin = (*queryMatcher)(nil)
 
 type Args struct {
-	ClientIP []string `yaml:"client_ip"`
-	ECS      []string `yaml:"ecs"`
-	Domain   []string `yaml:"domain"`
-	QType    []int    `yaml:"qtype"`
-	QClass   []int    `yaml:"qclass"`
+	ClientIP   []string `yaml:"client_ip"`
+	ECS        []string `yaml:"ecs"`
+	Domain     []string `yaml:"domain"`
+	QType      []int    `yaml:"qtype"`
+	QClass     []int    `yaml:"qclass"`
+	MacAddress []string `yaml:"mac_address"`
 	// TODO: Add PTR matcher.
 }
 
@@ -129,6 +131,18 @@ func newQueryMatcher(bp *coremain.BP, args *Args) (m *queryMatcher, err error) {
 	if len(args.QClass) > 0 {
 		elemMatcher := elem.NewIntMatcher(args.QClass)
 		m.matcherGroup = append(m.matcherGroup, msg_matcher.NewQClassMatcher(elemMatcher))
+	}
+	if len(args.MacAddress) > 0 {
+		mg, err := macaddr.BatchLoadMacProvider(
+			args.MacAddress,
+			bp.M().GetDataManager(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.matcherGroup = append(m.matcherGroup, msg_matcher.NewMacAddressMatcher(mg))
+		m.closer = append(m.closer, mg)
+		bp.L().Info("mac address matcher loaded", zap.Int("length", mg.Len()))
 	}
 
 	return m, nil

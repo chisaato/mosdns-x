@@ -20,6 +20,7 @@
 package dnsutils
 
 import (
+	"encoding/hex"
 	"net"
 
 	"github.com/miekg/dns"
@@ -46,6 +47,23 @@ func GetECS(opt *dns.OPT) (e *dns.EDNS0_SUBNET) {
 	for o := range opt.Option {
 		if opt.Option[o].Option() == dns.EDNS0SUBNET {
 			return opt.Option[o].(*dns.EDNS0_SUBNET)
+		}
+	}
+	return nil
+}
+func GetMsgMacAddress(m *dns.Msg) net.HardwareAddr {
+	opt := m.IsEdns0()
+	if opt == nil { // no opt, no ecs
+		return nil
+	}
+	return GetMacAddress(opt)
+}
+func GetMacAddress(opt *dns.OPT) net.HardwareAddr {
+	for o := range opt.Option {
+		if opt.Option[o].Option() == dns.EDNS0LOCALSTART {
+			// 解析为 mac 地址
+			data := opt.Option[o].(*dns.EDNS0_LOCAL).Data
+			return data
 		}
 	}
 	return nil
@@ -98,3 +116,25 @@ func NewEDNS0Subnet(ip net.IP, mask uint8, v6 bool) *dns.EDNS0_SUBNET {
 	edns0Subnet.SourceScope = 0
 	return edns0Subnet
 }
+
+type EDNS0_MACADDRESS struct {
+	Code       uint16 // always EDNS0MACADDRESS
+	MacAddress net.HardwareAddr
+}
+
+func (e *EDNS0_MACADDRESS) pack() ([]byte, error) {
+	h, err := hex.DecodeString(e.MacAddress.String())
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// Option implements the EDNS0 interface.
+func (e *EDNS0_MACADDRESS) Option() uint16 { return 65001 } // Option returns the option code.
+func (e *EDNS0_MACADDRESS) unpack(b []byte) error {
+	e.MacAddress = net.HardwareAddr(hex.EncodeToString(b))
+	return nil
+}
+func (e *EDNS0_MACADDRESS) String() string         { return e.MacAddress.String() }
+func (e *EDNS0_MACADDRESS) copy() EDNS0_MACADDRESS { return EDNS0_MACADDRESS{e.Code, e.MacAddress} }

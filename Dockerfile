@@ -33,3 +33,4 @@ EXPOSE 53/udp 53/tcp
 
 # 运行二进制
 ENTRYPOINT ["./mosdns"]
+CMD ["start"]

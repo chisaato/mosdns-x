@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-
 func TestMatcher_Match(t *testing.T) {
 	m := &Matcher{
 		macs: make(map[[6]byte]struct{}),

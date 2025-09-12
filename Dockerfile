@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o mosdns main.go
 FROM alpine:latest
 
 # 安装ca-certificates（如果需要）
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates curl
 
 # 设置工作目录
 WORKDIR /root/

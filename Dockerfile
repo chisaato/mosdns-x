@@ -32,5 +32,5 @@ COPY --from=builder /app/mosdns .
 EXPOSE 53/udp 53/tcp
 
 # 运行二进制
-ENTRYPOINT ["./mosdns"]
+ENTRYPOINT ["/root/mosdns"]
 CMD ["start"]

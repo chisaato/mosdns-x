@@ -21,11 +21,11 @@ func (m *Matcher) Match(mac net.HardwareAddr) bool {
 	if len(mac) != 6 {
 		return false
 	}
-	
+
 	// Convert []byte to [6]byte for use as a map key
 	var key [6]byte
 	copy(key[:], mac)
-	
+
 	_, found := m.macs[key]
 	return found
 }

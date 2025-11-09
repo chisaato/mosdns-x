@@ -121,6 +121,10 @@ func (s *Server) CreateETLSListner(l net.Listener, nextProtos []string) (net.Lis
 		AllowEarlyData: true,
 		MaxEarlyData:   4096,
 		NextProtos:     nextProtos,
+		Defaults: eTLS.Defaults{
+			AllSecureCipherSuites: true,
+			AllSecureCurves: true,
+		},
 		GetCertificate: func(_ *eTLS.ClientHelloInfo) (*eTLS.Certificate, error) {
 			return c.c, nil
 		},

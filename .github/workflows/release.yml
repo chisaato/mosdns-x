@@ -34,6 +34,7 @@ jobs:
           python ./release.py
         env:
           CGO_ENABLED: '0'
+          GOEXPERIMENT: greenteagc
           TZ: Asia/Hong_Kong
 
       - name: Publish

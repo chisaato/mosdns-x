@@ -8,10 +8,10 @@ jobs:
   build-release:
     runs-on: ubuntu-24.04
     steps:
-      - name: get latest go 1.25 version
+      - name: get latest go 1.26 version
         id: go
         run: |
-          echo version=$(curl -s https://raw.githubusercontent.com/actions/go-versions/update-versions-manifest-file/versions-manifest.json | grep -oE '"version": "1\.25(\.[0-9]{1,})?"' | head -1 | cut -d':' -f2 | sed 's/ //g; s/"//g') >> $GITHUB_OUTPUT
+          echo version=$(curl -s https://raw.githubusercontent.com/actions/go-versions/update-versions-manifest-file/versions-manifest.json | grep -oE '"version": "1\.26(\.[0-9]{1,})?"' | head -1 | cut -d':' -f2 | sed 's/ //g; s/"//g') >> $GITHUB_OUTPUT
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -34,7 +34,6 @@ jobs:
           python ./release.py
         env:
           CGO_ENABLED: '0'
-          GOEXPERIMENT: greenteagc
           TZ: Asia/Hong_Kong
 
       - name: Publish

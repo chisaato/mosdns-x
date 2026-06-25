@@ -23,15 +23,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 
+	"github.com/AdguardTeam/dnsproxy/fastip"
 	dnsproxy_upstream "github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/pmkol/mosdns-x/coremain"
-	"github.com/pmkol/mosdns-x/pkg/bundled_upstream"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
+	"go.uber.org/zap"
 )
 
 const PluginType = "adg_forward"
@@ -42,12 +45,26 @@ func init() {
 
 var _ coremain.ExecutablePlugin = (*adgForward)(nil)
 
+// UpstreamMode 对应 AdGuard 上游模式，与 dnsproxy/proxy.UpstreamMode 一致。
+type UpstreamMode string
+
+const (
+	ModeLoadBalance UpstreamMode = "load_balance" // 默认，加权随机
+	ModeParallel    UpstreamMode = "parallel"     // 并发请求，返回最先成功的
+	ModeFastestAddr UpstreamMode = "fastest_addr" // 最快 IP（查询全部上游 → ping → 返回最快 IP）
+)
+
 type Args struct {
 	// 上游地址列表。
 	Upstream []UpstreamConfig `yaml:"upstream"`
-	// 全局 bootstrap pool。该列表中的每个地址（必须是纯 IP）会被创建为一个
-	// bootstrap resolver，所有上游共享它们做并发域名解析。
+
+	// 全局 bootstrap pool。所有上游共享，做并发域名解析。
+	// 每个地址必须是纯 IP，支持任意协议。
 	Bootstrap []string `yaml:"bootstrap"`
+
+	// 上游模式，默认 load_balance。
+	Mode UpstreamMode `yaml:"mode"`
+
 	// 全局超时（秒），默认 5。
 	Timeout int `yaml:"timeout"`
 }
@@ -59,12 +76,43 @@ type UpstreamConfig struct {
 	Trusted            bool   `yaml:"trusted"`             // 未配置时第一个 upstream 强制 trusted
 }
 
+type rttStats struct {
+	mu        sync.Mutex
+	rttSum    float64 // 微秒累计
+	reqNum    float64
+}
+
+func (s *rttStats) update(rtt time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rttSum += float64(rtt.Microseconds())
+	s.reqNum++
+}
+
+func (s *rttStats) weight() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rttSum == 0 || s.reqNum == 0 {
+		return 1
+	}
+	return 1 / (s.rttSum / s.reqNum)
+}
+
 type adgForward struct {
 	*coremain.BP
 	args *Args
+	mode UpstreamMode
 
-	upstreamWrappers []bundled_upstream.Upstream
-	upstreamsCloser  []dnsproxy_upstream.Upstream
+	// dnsproxy 原生 upstream 列表。
+	rawUpstreams    []dnsproxy_upstream.Upstream
+	upstreamsCloser []dnsproxy_upstream.Upstream
+
+	// fastest_addr 模式
+	fastestAddr *fastip.FastestAddr
+
+	// load_balance 模式
+	rttLock   sync.Mutex
+	rttStatsMap map[string]*rttStats
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
@@ -81,13 +129,31 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 		timeout = 5 * time.Second
 	}
 
+	// 校验 mode
+	switch args.Mode {
+	case "", ModeLoadBalance:
+		args.Mode = ModeLoadBalance
+	case ModeParallel, ModeFastestAddr:
+	default:
+		return nil, fmt.Errorf("unknown upstream mode %q, supported: load_balance, parallel, fastest_addr", args.Mode)
+	}
+
 	f := &adgForward{
 		BP:   bp,
 		args: args,
+		mode: args.Mode,
+	}
+
+	if args.Mode == ModeFastestAddr {
+		f.fastestAddr = fastip.New(&fastip.Config{})
+	}
+
+	if args.Mode == ModeLoadBalance {
+		f.rttStatsMap = make(map[string]*rttStats)
 	}
 
 	// ── Build global bootstrap pool ──────────────────────────────────────
-	var globalBootstrap dnsproxy_upstream.Resolver // nil initially
+	var globalBootstrap dnsproxy_upstream.Resolver
 	if len(args.Bootstrap) > 0 {
 		bsOpts := &dnsproxy_upstream.Options{
 			Timeout: timeout,
@@ -136,48 +202,124 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 			return nil, fmt.Errorf("failed to init upstream %s: %w", c.Addr, err)
 		}
 
-		w := &upstreamWrapper{
-			address: c.Addr,
-			trusted: c.Trusted,
-			u:       u,
-		}
-		if i == 0 {
-			w.trusted = true // first upstream is always trusted
-		}
-
-		f.upstreamWrappers = append(f.upstreamWrappers, w)
+		_ = i // 当前模式下不需要 upstreamWrapper，直接用 rawUpstreams
+		f.rawUpstreams = append(f.rawUpstreams, u)
 		f.upstreamsCloser = append(f.upstreamsCloser, u)
 	}
+
+	bp.L().Info("adg_forward initialized",
+		zap.Int("upstreams", len(args.Upstream)),
+		zap.String("mode", string(args.Mode)),
+		zap.Int("bootstrap", len(args.Bootstrap)),
+	)
 
 	return f, nil
 }
 
-type upstreamWrapper struct {
-	address string
-	trusted bool
-	u       dnsproxy_upstream.Upstream
-}
-
-func (w *upstreamWrapper) Exchange(_ context.Context, q *dns.Msg) (*dns.Msg, error) {
-	q.Compress = true
-	return w.u.Exchange(q)
-}
-
-func (w *upstreamWrapper) Address() string {
-	return w.address
-}
-
-func (w *upstreamWrapper) Trusted() bool {
-	return w.trusted
-}
-
+// Exec 根据 mode 选择查询策略。
 func (f *adgForward) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	r, err := bundled_upstream.ExchangeParallel(ctx, qCtx, f.upstreamWrappers, f.L())
+	q := qCtx.Q()
+
+	var r *dns.Msg
+	var err error
+
+	switch f.mode {
+	case ModeParallel:
+		r, err = f.execParallel(q)
+	case ModeFastestAddr:
+		r, err = f.execFastestAddr(q)
+	default: // ModeLoadBalance
+		r, err = f.execLoadBalance(q)
+	}
+
 	if err != nil {
 		return err
 	}
+
 	qCtx.SetResponse(r)
 	return executable_seq.ExecChainNode(ctx, qCtx, next)
+}
+
+// execParallel 并发查询所有 upstream，返回第一个成功响应。
+func (f *adgForward) execParallel(q *dns.Msg) (*dns.Msg, error) {
+	r, _, err := dnsproxy_upstream.ExchangeParallel(f.rawUpstreams, q.Copy())
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// execFastestAddr 查询所有 upstream，对返回的 IP 地址 ping 测速，返回最快 IP 的响应。
+func (f *adgForward) execFastestAddr(q *dns.Msg) (*dns.Msg, error) {
+	r, _, err := f.fastestAddr.ExchangeFastest(q, f.rawUpstreams)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// execLoadBalance 基于 RTT 加权随机选择一个 upstream 查询。
+func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
+	if len(f.rawUpstreams) == 1 {
+		r, err := f.rawUpstreams[0].Exchange(q)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+
+	// 加权随机选择
+	weights := make([]float64, len(f.rawUpstreams))
+	f.rttLock.Lock()
+	for i := range f.rawUpstreams {
+		addr := f.rawUpstreams[i].Address()
+		stats := f.rttStatsMap[addr]
+		if stats == nil {
+			weights[i] = 1
+		} else {
+			weights[i] = stats.weight()
+		}
+	}
+	f.rttLock.Unlock()
+
+	idx := weightedSelect(weights)
+	start := time.Now()
+	r, err := f.rawUpstreams[idx].Exchange(q)
+
+	// 更新 RTT 统计
+	elapsed := time.Since(start)
+	addr := f.rawUpstreams[idx].Address()
+
+	f.rttLock.Lock()
+	stats, ok := f.rttStatsMap[addr]
+	if !ok {
+		stats = new(rttStats)
+		f.rttStatsMap[addr] = stats
+	}
+	f.rttLock.Unlock()
+	stats.update(elapsed)
+
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// weightedSelect 根据权重切片随机选择一个下标。
+func weightedSelect(weights []float64) int {
+	var total float64
+	for _, w := range weights {
+		total += w
+	}
+	r := rand.Float64() * total
+	var cum float64
+	for i, w := range weights {
+		cum += w
+		if r < cum {
+			return i
+		}
+	}
+	return len(weights) - 1
 }
 
 func (f *adgForward) Shutdown() error {

@@ -21,7 +21,6 @@ package msg_matcher
 
 import (
 	"context"
-	"net"
 	"net/netip"
 
 	"github.com/miekg/dns"
@@ -127,26 +126,4 @@ func (m *QClassMatcher) MatchMsg(msg *dns.Msg) bool {
 		}
 	}
 	return false
-}
-
-type ClientMacAddressMatcher struct {
-	macAddressMatcher interface {
-		Match(mac net.HardwareAddr) bool
-		Len() int
-		Close() error
-	}
-}
-
-func NewMacAddressMatcher(macAddressMatcher interface {
-	Match(mac net.HardwareAddr) bool
-	Len() int
-	Close() error
-}) *ClientMacAddressMatcher {
-	return &ClientMacAddressMatcher{macAddressMatcher: macAddressMatcher}
-}
-func (m *ClientMacAddressMatcher) Match(_ context.Context, qCtx *query_context.Context) (matched bool, err error) {
-	if macAddress := dnsutils.GetMsgMacAddress(qCtx.Q()); macAddress != nil {
-		return m.macAddressMatcher.Match(macAddress), nil
-	}
-	return false, nil
 }

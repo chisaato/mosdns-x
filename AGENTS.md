@@ -22,12 +22,42 @@
 
 ## 本 fork 自定义改动
 
-- **MAC 地址匹配**: 新增 `pkg/matcher/macaddr/` MAC 地址匹配器，`query_matcher` 新增 `mac_address` 配置字段，用于匹配 DNS 请求中 dnsmasq 附加的客户端 MAC 地址
+- **MAC 地址匹配**: 新增 `plugin/matcher/mac_matcher/` 独立匹配器插件（`type: mac_matcher`），从 EDNS0 option code 65001 中提取 dnsmasq (OpenWrt) 附加的客户端 MAC 地址并匹配。核心逻辑位于 `pkg/matcher/macaddr/`（匹配器 + `ExtractFromMsg()` 提取函数）。
 - **Docker 构建**: 已恢复（`Dockerfile` + `build-image.yml`）
+
+### 减少上游合并冲突的设计原则
+
+fork 专属代码应集中在新文件或新包中，避免修改上游已有文件。涉及上游文件的改动应在验证可行后尽量还原：
+
+| 上游文件 | 改动方式 |
+|----------|----------|
+| `pkg/dnsutils/`, `pkg/matcher/msg_matcher/` 等 | 不修改，提取逻辑到 `pkg/matcher/macaddr/` 自有包中 |
+| `plugin/matcher/query_matcher/` | 不修改，拆分出独立 `mac_matcher` 插件 |
+| `plugin/enabled_plugin.go` | 仅添加 blank import（一目了然的单行） |
 
 ## 合并上游更改
 
-`upstream` 指向 `github.com/pmkol/mosdns-x`。需要合并时：`git fetch upstream && git merge upstream/main`。
+`upstream` 指向 `github.com/pmkol/mosdns-x`。
+
+**推荐使用 rebase 而非 merge**：`git merge` 会产生 merge commit，且导致 fork 本地与上游「同内容不同 hash」的 commit 共存，GitHub 会据此显示 "N commits behind"。
+
+```bash
+# 正确做法：rebase 到上游最新
+git fetch upstream
+git rebase upstream/main
+
+# 如果有未提交的改动先暂存
+git stash
+git rebase upstream/main
+git stash pop
+
+# rebase 完成后强制推送（fork 专属分支）
+git push --force-with-lease origin main
+```
+
+**rebase 后 GitHub 的 behind 计数归零**，因为 fork 的 commit DAG 以 upstream 最新提交为线性祖先。同名变更的 commit 会被自动跳过。
+
+如果 rebase 中途出现冲突且确认某 commit 的内容已被上游覆盖，用 `git rebase --skip` 跳过。
 
 ## 构建与测试
 
@@ -56,6 +86,9 @@ plugins:
       domain:
         - "example.com"
         - "provider:my_domain_list"
+  - tag: my_mac_match
+    type: mac_matcher
+    args:
       mac_address:
         - "aa:bb:cc:dd:ee:ff"
   - tag: my_cache

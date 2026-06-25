@@ -31,6 +31,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/cache"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/client_limiter"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/dual_selector"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/ech_block"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ecs"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/edns0_filter"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/fast_forward"
@@ -49,6 +50,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/sequence"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/sleep"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ttl"
+	_ "github.com/pmkol/mosdns-x/plugin/matcher/mac_matcher"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/query_matcher"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/response_matcher"
 )

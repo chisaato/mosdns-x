@@ -23,3 +23,6 @@ release/
 
 # test utils
 testutils/
+
+# omo runtime
+.omo/run-continuation

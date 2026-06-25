@@ -21,6 +21,9 @@ package plugin
 
 // import all plugins
 import (
+	_ "github.com/pmkol/mosdns-x/plugin/executable/adg_cache"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/adg_filter"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/adg_forward"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/answer_shuffle"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/arbitrary"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/blackhole"

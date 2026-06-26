@@ -53,6 +53,9 @@ type RequestMeta struct {
 	serverName string
 
 	protocol string
+
+	// mosdns-x: clientID extracted from URL path prefix (e.g. /dns-query/family -> "family").
+	clientID string
 }
 
 func NewRequestMeta(addr netip.Addr) *RequestMeta {
@@ -89,6 +92,14 @@ func (m *RequestMeta) GetProtocol() string {
 
 func (m *RequestMeta) GetServerName() string {
 	return m.serverName
+}
+
+func (m *RequestMeta) SetClientID(clientID string) {
+	m.clientID = clientID
+}
+
+func (m *RequestMeta) GetClientID() string {
+	return m.clientID
 }
 
 // Context is a query context that pass through plugins

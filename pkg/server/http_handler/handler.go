@@ -136,11 +136,26 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 	}
 
 	// check url path
-	if len(h.opts.Path) != 0 && req.URL().Path != h.opts.Path {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("invalid request path"))
-		h.warnErr(req, fmt.Errorf("invalid request path %s", req.URL().Path))
-		return
+	if len(h.opts.Path) != 0 {
+		path := req.URL().Path
+		if path != h.opts.Path {
+			prefix := h.opts.Path + "/"
+			if strings.HasPrefix(path, prefix) {
+				// mosdns-x: extract client ID from path suffix
+				if id := path[len(prefix):]; id != "" {
+					// only take the first segment
+					if idx := strings.IndexByte(id, '/'); idx > 0 {
+						id = id[:idx]
+					}
+					meta.SetClientID(id)
+				}
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte("invalid request path"))
+				h.warnErr(req, fmt.Errorf("invalid request path %s", req.URL().Path))
+				return
+			}
+		}
 	}
 
 	var b []byte

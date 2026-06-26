@@ -35,6 +35,10 @@ plugins:
       blocking_ipv4: "0.0.0.0" # zero_ip / custom_ip 时使用
       blocking_ipv6: "::"
 
+      # 本地缓存目录（可选），启用后过滤列表会缓存到该目录。
+      # 重启时优先读取本地缓存，避免重新下载；下载失败时也回退到缓存。
+      cache_dir: "/var/lib/mosdns/adg_cache"
+
       # 自动更新间隔（秒），默认 86400（24h）
       update_interval: 86400
 ```
@@ -56,6 +60,15 @@ plugins:
 - `block_inline` / `allow_inline`：内联规则，重启生效
 
 支持 AdBlock 语法（`||domain.com^`）、纯域名列表、hosts 格式。
+
+## 本地缓存
+
+配置 `cache_dir` 后可启用本地磁盘缓存：
+
+- **加速启动**：重启时优先读取本地缓存文件，避免每次启动都重新下载
+- **断网保护**：定时更新或启动时下载失败时，自动回退到本地缓存
+- **缓存文件名**：每个 URL 的 SHA256 哈希值，无过期问题（由 `update_interval` 控制更新频率）
+- **缓存更新**：每次成功下载后自动刷新本地缓存文件
 
 ## 匹配流程
 

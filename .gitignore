@@ -26,3 +26,6 @@ testutils/
 
 # omo runtime
 .omo/run-continuation
+
+# 一不小心构建的二进制
+./mosdns

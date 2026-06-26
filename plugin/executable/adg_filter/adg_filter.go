@@ -2,10 +2,14 @@ package adg_filter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +55,7 @@ type Args struct {
 	BlockingIPv4   string `yaml:"blocking_ipv4"`    // custom IP for A (default "0.0.0.0")
 	BlockingIPv6   string `yaml:"blocking_ipv6"`    // custom IP for AAAA (default "::")
 	UpdateInterval int    `yaml:"update_interval"`  // seconds, default 86400 (24h)
+	CacheDir       string `yaml:"cache_dir"`         // 本地磁盘缓存目录（可选），启用后过滤列表会缓存到本地，避免重启后重新下载
 }
 
 type adgFilter struct {
@@ -202,33 +207,97 @@ func (f *adgFilter) buildEngine(
 	return urlfilter.NewDNSEngine(storage), nil
 }
 
-// downloadURL downloads content from a URL.
+// downloadURL downloads a filter list from URL with disk cache support.
+// On success the data is written to the local cache; on failure it falls
+// back to the cached copy (if any).
 func (f *adgFilter) downloadURL(rawURL string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to create request: %w", err))
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download: %w", err)
+		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to download: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return f.tryCacheFallback(rawURL, fmt.Errorf("unexpected status code: %d", resp.StatusCode))
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to read response body: %w", err))
+	}
+
+	if f.args.CacheDir != "" {
+		if err := f.writeCacheFile(rawURL, data); err != nil {
+			f.L().Warn("failed to write filter cache file",
+				zap.String("url", rawURL),
+				zap.Error(err),
+			)
+		} else {
+			f.L().Debug("filter list cached to disk", zap.String("url", rawURL))
+		}
 	}
 
 	return data, nil
+}
+
+// tryCacheFallback reads the local cache on download failure.
+func (f *adgFilter) tryCacheFallback(rawURL string, origErr error) ([]byte, error) {
+	if f.args.CacheDir == "" {
+		return nil, origErr
+	}
+	data, err := f.readCacheFile(rawURL)
+	if err != nil {
+		return nil, origErr
+	}
+	f.L().Info("using cached filter list (download failed)",
+		zap.String("url", rawURL),
+	)
+	return data, nil
+}
+
+// cachePathForURL returns the local cache file path for a given URL.
+func (f *adgFilter) cachePathForURL(rawURL string) string {
+	if f.args.CacheDir == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(rawURL))
+	filename := hex.EncodeToString(h[:])
+	return filepath.Join(f.args.CacheDir, filename)
+}
+
+func (f *adgFilter) readCacheFile(rawURL string) ([]byte, error) {
+	path := f.cachePathForURL(rawURL)
+	if path == "" {
+		return nil, fmt.Errorf("cache not configured")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cache read failed: %w", err)
+	}
+	return data, nil
+}
+
+func (f *adgFilter) writeCacheFile(rawURL string, data []byte) error {
+	path := f.cachePathForURL(rawURL)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(f.args.CacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache dir: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write cache file: %w", err)
+	}
+	return nil
 }
 
 // updateLoop periodically re-downloads URL lists and swaps engines.

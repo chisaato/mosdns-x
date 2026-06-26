@@ -18,7 +18,7 @@ RUN go mod download
 COPY . .
 
 # 构建二进制文件
-RUN CGO_ENABLED=0 GOOS=linux go build -o mosdns main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o mosdns main.go
 
 # 运行阶段
 FROM alpine:latest

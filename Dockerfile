@@ -1,5 +1,5 @@
 # 多阶段构建：构建阶段
-FROM golang:1.26-alpine AS builder
+FROM golang:alpine AS builder
 
 # 强制启用 Go 自动前滚，允许 go.mod 要求的更高版本自动下载 toolchain
 # 主要是防止 CI 里忘了更新这个 Dockerfile

@@ -1,14 +1,15 @@
-version: '3.8'
-
 services:
   mosdns:
-    build: .
+    image: ghcr.io/chisaato/mosdns-x:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: mosdns
     ports:
       - "53:53/udp"
       - "53:53/tcp"
     volumes:
-      - ./config:/root/config  # 假设配置文件在config目录，可选
+      - ./config:/root/config # 假设配置文件在config目录，可选
     restart: unless-stopped
     # 健康检查用于测试
     healthcheck:

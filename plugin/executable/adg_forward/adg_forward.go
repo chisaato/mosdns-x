@@ -220,6 +220,13 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 func (f *adgForward) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
 	q := qCtx.Q()
 
+	f.L().Info("adg_forward: query",
+		zap.String("host", q.Question[0].Name),
+		zap.String("qtype", dns.Type(q.Question[0].Qtype).String()),
+		zap.String("mode", string(f.mode)),
+		qCtx.InfoField(),
+	)
+
 	var r *dns.Msg
 	var err error
 
@@ -242,29 +249,55 @@ func (f *adgForward) Exec(ctx context.Context, qCtx *query_context.Context, next
 
 // execParallel 并发查询所有 upstream，返回第一个成功响应。
 func (f *adgForward) execParallel(q *dns.Msg) (*dns.Msg, error) {
-	r, _, err := dnsproxy_upstream.ExchangeParallel(f.rawUpstreams, q.Copy())
+	r, resolved, err := dnsproxy_upstream.ExchangeParallel(f.rawUpstreams, q.Copy())
 	if err != nil {
 		return nil, err
 	}
+	addr := ""
+	if resolved != nil {
+		addr = resolved.Address()
+	}
+	f.L().Info("adg_forward: forwarded (parallel)",
+		zap.String("upstream", addr),
+	)
 	return r, nil
 }
 
 // execFastestAddr 查询所有 upstream，对返回的 IP 地址 ping 测速，返回最快 IP 的响应。
 func (f *adgForward) execFastestAddr(q *dns.Msg) (*dns.Msg, error) {
-	r, _, err := f.fastestAddr.ExchangeFastest(q, f.rawUpstreams)
+	r, resolved, err := f.fastestAddr.ExchangeFastest(q, f.rawUpstreams)
 	if err != nil {
 		return nil, err
 	}
+	addr := ""
+	if resolved != nil {
+		addr = resolved.Address()
+	}
+	f.L().Info("adg_forward: forwarded (fastest_addr)",
+		zap.String("upstream", addr),
+	)
 	return r, nil
 }
 
 // execLoadBalance 基于 RTT 加权随机选择一个 upstream 查询。
 func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
 	if len(f.rawUpstreams) == 1 {
+		addr := f.rawUpstreams[0].Address()
+		start := time.Now()
 		r, err := f.rawUpstreams[0].Exchange(q)
+		elapsed := time.Since(start)
 		if err != nil {
+			f.L().Warn("adg_forward: upstream error",
+				zap.String("upstream", addr),
+				zap.Duration("rtt", elapsed),
+				zap.Error(err),
+			)
 			return nil, err
 		}
+		f.L().Info("adg_forward: forwarded",
+			zap.String("upstream", addr),
+			zap.Duration("rtt", elapsed),
+		)
 		return r, nil
 	}
 
@@ -300,8 +333,18 @@ func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
 	stats.update(elapsed)
 
 	if err != nil {
+		f.L().Warn("adg_forward: upstream error",
+			zap.String("upstream", addr),
+			zap.Duration("rtt", elapsed),
+			zap.Error(err),
+		)
 		return nil, err
 	}
+
+	f.L().Info("adg_forward: forwarded",
+		zap.String("upstream", addr),
+		zap.Duration("rtt", elapsed),
+	)
 	return r, nil
 }
 

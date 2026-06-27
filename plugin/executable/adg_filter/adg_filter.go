@@ -374,18 +374,28 @@ func (f *adgFilter) Exec(ctx context.Context, qCtx *query_context.Context, next 
 	// Check allowlist first — if matched, pass through.
 	if allowEngine != nil {
 		if _, matched := allowEngine.MatchRequest(req); matched {
-			f.L().Debug("allowlist hit, pass through", zap.String("host", hostname))
+			f.L().Info("adg_filter: allowlist hit, pass through",
+				zap.String("host", hostname),
+				zap.String("qtype", dns.Type(qtype).String()),
+			)
 			return executable_seq.ExecChainNode(ctx, qCtx, next)
 		}
 	}
 
 	// Check blocklist — if matched, block.
 	if _, matched := blockEngine.MatchRequest(req); matched {
-		f.L().Debug("blocklist hit, blocking", zap.String("host", hostname))
+		f.L().Info("adg_filter: blocklist hit, blocked",
+			zap.String("host", hostname),
+			zap.String("qtype", dns.Type(qtype).String()),
+		)
 		f.applyBlock(qCtx, q, qtype)
 		return nil
 	}
 
+	f.L().Debug("adg_filter: no match, pass through",
+		zap.String("host", hostname),
+		zap.String("qtype", dns.Type(qtype).String()),
+	)
 	return executable_seq.ExecChainNode(ctx, qCtx, next)
 }
 

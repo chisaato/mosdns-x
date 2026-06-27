@@ -35,9 +35,22 @@ const PluginType = "mac_matcher"
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
+	coremain.RegNewPersetPluginFunc("_has_mac_addr", func(bp *coremain.BP) (coremain.Plugin, error) {
+		return &hasMACAddr{BP: bp}, nil
+	})
 }
 
 var _ coremain.MatcherPlugin = (*macMatcher)(nil)
+
+type hasMACAddr struct {
+	*coremain.BP
+}
+
+var _ coremain.MatcherPlugin = (*hasMACAddr)(nil)
+
+func (h *hasMACAddr) Match(_ context.Context, qCtx *query_context.Context) (matched bool, err error) {
+	return macaddr.ExtractFromMsg(qCtx.Q()) != nil, nil
+}
 
 // Args contains configuration for the mac_matcher plugin.
 type Args struct {

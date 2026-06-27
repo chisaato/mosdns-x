@@ -2,8 +2,6 @@ package adg_filter
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,6 +36,10 @@ var _ coremain.ExecutablePlugin = (*adgFilter)(nil)
 type FilterListConfig struct {
 	URL  string `yaml:"url"`
 	Name string `yaml:"name"`
+	ID   int    `yaml:"id"`
+	// 占位符,兼容 AdGuard Home 格式,暂未使用
+	// 不应被删除
+	Enabled *bool `yaml:"enabled,omitempty"`
 }
 
 type Args struct {
@@ -51,21 +53,21 @@ type Args struct {
 	// 白名单：用户手工填入的内联规则
 	AllowInline []string `yaml:"allow_inline"`
 
-	BlockMode      string `yaml:"block_mode"`       // "nxdomain" (default), "refused", "zero_ip", "custom_ip"
-	BlockingIPv4   string `yaml:"blocking_ipv4"`    // custom IP for A (default "0.0.0.0")
-	BlockingIPv6   string `yaml:"blocking_ipv6"`    // custom IP for AAAA (default "::")
-	UpdateInterval int    `yaml:"update_interval"`  // seconds, default 86400 (24h)
-	CacheDir       string `yaml:"cache_dir"`         // 本地磁盘缓存目录（可选），启用后过滤列表会缓存到本地，避免重启后重新下载
+	BlockMode      string `yaml:"block_mode"`      // "nxdomain" (default), "refused", "zero_ip", "custom_ip"
+	BlockingIPv4   string `yaml:"blocking_ipv4"`   // custom IP for A (default "0.0.0.0")
+	BlockingIPv6   string `yaml:"blocking_ipv6"`   // custom IP for AAAA (default "::")
+	UpdateInterval int    `yaml:"update_interval"` // seconds, default 86400 (24h)
+	CacheDir       string `yaml:"cache_dir"`       // 本地磁盘缓存目录（可选），启用后过滤列表会缓存到本地，避免重启后重新下载
 }
 
 type adgFilter struct {
 	*coremain.BP
 	args *Args
 
-	blockEngine     *urlfilter.DNSEngine
-	allowEngine     *urlfilter.DNSEngine
-	blockingIPv4    netip.Addr
-	blockingIPv6    netip.Addr
+	blockEngine  *urlfilter.DNSEngine
+	allowEngine  *urlfilter.DNSEngine
+	blockingIPv4 netip.Addr
+	blockingIPv6 netip.Addr
 
 	mu     sync.RWMutex
 	cancel context.CancelFunc
@@ -113,28 +115,10 @@ func newAdgFilter(bp *coremain.BP, args *Args) (*adgFilter, error) {
 		blockingIPv6: ipv6,
 	}
 
-	// Build block engine (URL lists + inline rules).
-	blockEngine, err := f.buildEngine(args.BlockLists, args.BlockInline, 1)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build block engine: %w", err)
-	}
-	f.blockEngine = blockEngine
-
-	// Build allow engine (URL lists + inline rules).
+	// Phase 1: instant engine from cache only (no HTTP).
+	f.blockEngine = f.buildEngineCached(args.BlockLists, args.BlockInline, 1)
 	if len(args.AllowLists) > 0 || len(args.AllowInline) > 0 {
-		allowEngine, err := f.buildEngine(args.AllowLists, args.AllowInline, 1000000)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build allow engine: %w", err)
-		}
-		f.allowEngine = allowEngine
-	}
-
-	// Background update loop if any URL list is configured.
-	if len(args.BlockLists) > 0 || len(args.AllowLists) > 0 {
-		ctx, cancel := context.WithCancel(context.Background())
-		f.cancel = cancel
-		f.done = make(chan struct{})
-		go f.updateLoop(ctx)
+		f.allowEngine = f.buildEngineCached(args.AllowLists, args.AllowInline, 1000000)
 	}
 
 	bp.L().Info("adg_filter initialized",
@@ -143,11 +127,94 @@ func newAdgFilter(bp *coremain.BP, args *Args) (*adgFilter, error) {
 		zap.String("block_mode", args.BlockMode),
 	)
 
+	// Phase 2: background full download + periodic updates (never blocks startup).
+	if args.CacheDir != "" {
+		activeIDs := make([]int, 0, len(args.BlockLists)+len(args.AllowLists))
+		for _, l := range args.BlockLists {
+			activeIDs = append(activeIDs, l.ID)
+		}
+		for _, l := range args.AllowLists {
+			activeIDs = append(activeIDs, l.ID)
+		}
+		f.cleanOrphanCaches(activeIDs)
+	}
+
+	if len(args.BlockLists) > 0 || len(args.AllowLists) > 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		f.cancel = cancel
+		f.done = make(chan struct{})
+		go f.runBackground(ctx)
+	}
+
 	return f, nil
 }
 
+// buildEngineCached builds a urlfilter.DNSEngine from cache only (no HTTP).
+// URL lists missing from cache are silently skipped so startup never blocks.
+func (f *adgFilter) buildEngineCached(
+	urls []FilterListConfig,
+	inline []string,
+	baseID rules.ListID,
+) *urlfilter.DNSEngine {
+	var lists []filterlist.Interface
+	id := baseID
+
+	if len(inline) > 0 {
+		text := strings.Join(inline, "\n")
+		s := filterlist.NewString(&filterlist.StringConfig{
+			ID:             id,
+			RulesText:      text,
+			IgnoreCosmetic: true,
+		})
+		lists = append(lists, s)
+		id++
+	}
+
+	for _, uc := range urls {
+		path := f.cachePath(uc.ID)
+		if path == "" {
+			continue
+		}
+		data, err := f.readCacheFile(path)
+		if err != nil {
+			f.L().Debug("no cache for filter list, will download later",
+				zap.Int("id", uc.ID),
+				zap.String("name", uc.Name),
+			)
+			continue
+		}
+		b := filterlist.NewBytes(&filterlist.BytesConfig{
+			ID:             id,
+			RulesText:      data,
+			IgnoreCosmetic: true,
+		})
+		lists = append(lists, b)
+		f.L().Info("loaded filter list from cache",
+			zap.Int("id", uc.ID),
+			zap.String("name", uc.Name),
+			zap.Int("bytes", len(data)),
+		)
+		id++
+	}
+
+	if len(lists) == 0 {
+		storage, _ := filterlist.NewRuleStorage(nil)
+		return urlfilter.NewDNSEngine(storage)
+	}
+
+	storage, err := filterlist.NewRuleStorage(lists)
+	if err != nil {
+		for _, l := range lists {
+			_ = l.Close()
+		}
+		storage, _ := filterlist.NewRuleStorage(nil)
+		return urlfilter.NewDNSEngine(storage)
+	}
+	return urlfilter.NewDNSEngine(storage)
+}
+
 // buildEngine creates a urlfilter.DNSEngine from URL lists and inline rules.
-// baseID is the starting ListID prefix.
+// It always re-downloads URL lists (no cache path). baseID is the starting ListID prefix.
 func (f *adgFilter) buildEngine(
 	urls []FilterListConfig,
 	inline []string,
@@ -170,9 +237,10 @@ func (f *adgFilter) buildEngine(
 
 	// URL-based filter lists (downloaded).
 	for _, uc := range urls {
-		data, err := f.downloadURL(uc.URL)
+		data, err := f.downloadURL(uc.URL, uc.ID)
 		if err != nil {
 			f.L().Warn("failed to download filter list, skipping",
+				zap.Int("id", uc.ID),
 				zap.String("url", uc.URL),
 				zap.String("name", uc.Name),
 				zap.Error(err),
@@ -185,6 +253,11 @@ func (f *adgFilter) buildEngine(
 			IgnoreCosmetic: true,
 		})
 		lists = append(lists, b)
+		f.L().Info("filter list loaded",
+			zap.Int("id", uc.ID),
+			zap.String("name", uc.Name),
+			zap.Int("bytes", len(data)),
+		)
 		id++
 	}
 
@@ -207,102 +280,136 @@ func (f *adgFilter) buildEngine(
 	return urlfilter.NewDNSEngine(storage), nil
 }
 
-// downloadURL downloads a filter list from URL with disk cache support.
-// On success the data is written to the local cache; on failure it falls
-// back to the cached copy (if any).
-func (f *adgFilter) downloadURL(rawURL string) ([]byte, error) {
+func (f *adgFilter) cachePath(id int) string {
+	if f.args.CacheDir == "" {
+		return ""
+	}
+	return filepath.Join(f.args.CacheDir, fmt.Sprintf("%d.txt", id))
+}
+
+func (f *adgFilter) isCacheValid(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	interval := time.Duration(f.args.UpdateInterval) * time.Second
+	return st.ModTime().Add(interval).After(time.Now())
+}
+
+func (f *adgFilter) readCacheFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func (f *adgFilter) writeCacheFile(path string, data []byte) error {
+	if err := os.MkdirAll(f.args.CacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache dir: %w", err)
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func (f *adgFilter) cleanOrphanCaches(activeIDs []int) {
+	if f.args.CacheDir == "" {
+		return
+	}
+	activeSet := make(map[string]struct{}, len(activeIDs))
+	for _, id := range activeIDs {
+		activeSet[f.cachePath(id)] = struct{}{}
+	}
+	entries, err := os.ReadDir(f.args.CacheDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		p := filepath.Join(f.args.CacheDir, e.Name())
+		if _, keep := activeSet[p]; !keep {
+			if err := os.Remove(p); err == nil {
+				f.L().Debug("removed orphan cache file", zap.String("file", e.Name()))
+			}
+		}
+	}
+}
+
+// downloadURL returns cached data if still valid, otherwise downloads remote.
+func (f *adgFilter) downloadURL(rawURL string, id int) ([]byte, error) {
+	path := f.cachePath(id)
+	if path != "" && f.isCacheValid(path) {
+		data, err := f.readCacheFile(path)
+		if err == nil {
+			f.L().Info("loaded filter list from cache",
+				zap.Int("id", id),
+				zap.String("url", rawURL),
+			)
+			return data, nil
+		}
+	}
+	return f.downloadAndCache(rawURL, path, id)
+}
+
+func (f *adgFilter) downloadAndCache(rawURL, path string, id int) ([]byte, error) {
+	f.L().Info("downloading filter list",
+		zap.Int("id", id),
+		zap.String("url", rawURL),
+	)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to create request: %w", err))
+		return f.tryCache(path, fmt.Errorf("failed to create request: %w", err))
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to download: %w", err))
+		return f.tryCache(path, fmt.Errorf("failed to download: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return f.tryCacheFallback(rawURL, fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+		return f.tryCache(path, fmt.Errorf("unexpected status code: %d", resp.StatusCode))
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return f.tryCacheFallback(rawURL, fmt.Errorf("failed to read response body: %w", err))
+		return f.tryCache(path, fmt.Errorf("failed to read response body: %w", err))
 	}
 
-	if f.args.CacheDir != "" {
-		if err := f.writeCacheFile(rawURL, data); err != nil {
+	if path != "" {
+		if err := f.writeCacheFile(path, data); err != nil {
 			f.L().Warn("failed to write filter cache file",
-				zap.String("url", rawURL),
+				zap.Int("id", id),
 				zap.Error(err),
 			)
-		} else {
-			f.L().Debug("filter list cached to disk", zap.String("url", rawURL))
 		}
 	}
-
 	return data, nil
 }
 
-// tryCacheFallback reads the local cache on download failure.
-func (f *adgFilter) tryCacheFallback(rawURL string, origErr error) ([]byte, error) {
-	if f.args.CacheDir == "" {
+func (f *adgFilter) tryCache(path string, origErr error) ([]byte, error) {
+	if path == "" {
 		return nil, origErr
 	}
-	data, err := f.readCacheFile(rawURL)
+	data, err := f.readCacheFile(path)
 	if err != nil {
 		return nil, origErr
 	}
 	f.L().Info("using cached filter list (download failed)",
-		zap.String("url", rawURL),
+		zap.String("file", filepath.Base(path)),
 	)
 	return data, nil
 }
 
-// cachePathForURL returns the local cache file path for a given URL.
-func (f *adgFilter) cachePathForURL(rawURL string) string {
-	if f.args.CacheDir == "" {
-		return ""
-	}
-	h := sha256.Sum256([]byte(rawURL))
-	filename := hex.EncodeToString(h[:])
-	return filepath.Join(f.args.CacheDir, filename)
-}
-
-func (f *adgFilter) readCacheFile(rawURL string) ([]byte, error) {
-	path := f.cachePathForURL(rawURL)
-	if path == "" {
-		return nil, fmt.Errorf("cache not configured")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("cache read failed: %w", err)
-	}
-	return data, nil
-}
-
-func (f *adgFilter) writeCacheFile(rawURL string, data []byte) error {
-	path := f.cachePathForURL(rawURL)
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(f.args.CacheDir, 0755); err != nil {
-		return fmt.Errorf("failed to create cache dir: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write cache file: %w", err)
-	}
-	return nil
-}
-
-// updateLoop periodically re-downloads URL lists and swaps engines.
-func (f *adgFilter) updateLoop(ctx context.Context) {
+// runBackground does an initial full download then enters the periodic update
+// loop. Never blocks startup — goroutine launched from Init.
+func (f *adgFilter) runBackground(ctx context.Context) {
 	defer close(f.done)
+
+	f.L().Info("adg_filter: starting background filter update")
+	f.updateEngines()
 
 	ticker := time.NewTicker(time.Duration(f.args.UpdateInterval) * time.Second)
 	defer ticker.Stop()

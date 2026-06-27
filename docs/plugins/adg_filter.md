@@ -13,8 +13,10 @@ plugins:
       block_lists:
         - url: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
           name: "AdGuard DNS filter"
+          id: 1
         - url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.plus.txt"
           name: "HaGeZi Pro++"
+          id: 2
 
       # 手工填写的拦截规则 (AdBlock 语法或纯域名)
       block_inline:
@@ -26,6 +28,7 @@ plugins:
       allow_lists:
         - url: "https://example.com/my-allowlist.txt"
           name: "My allowlist"
+          id: 100
 
       allow_inline:
         - "@@||good-ads.example.com^"
@@ -35,8 +38,7 @@ plugins:
       blocking_ipv4: "0.0.0.0" # zero_ip / custom_ip 时使用
       blocking_ipv6: "::"
 
-      # 本地缓存目录（可选），启用后过滤列表会缓存到该目录。
-      # 重启时优先读取本地缓存，避免重新下载；下载失败时也回退到缓存。
+      # 本地缓存目录（可选），启用后基于文件 mtime 判断缓存时效
       cache_dir: "/var/lib/mosdns/adg_cache"
 
       # 自动更新间隔（秒），默认 86400（24h）
@@ -65,10 +67,15 @@ plugins:
 
 配置 `cache_dir` 后可启用本地磁盘缓存：
 
-- **加速启动**：重启时优先读取本地缓存文件，避免每次启动都重新下载
-- **断网保护**：定时更新或启动时下载失败时，自动回退到本地缓存
-- **缓存文件名**：每个 URL 的 SHA256 哈希值，无过期问题（由 `update_interval` 控制更新频率）
-- **缓存更新**：每次成功下载后自动刷新本地缓存文件
+```yaml
+args:
+  cache_dir: "/var/lib/mosdns/adg_cache"
+```
+
+- **文件名**：每个过滤列表的 `id` + `.txt`，例 `1.txt`、`2.txt`，与 AdGuard Home 惯例一致
+- **缓存时效**：文件 mtime + `update_interval` 还在有效期内 → 完全不发 HTTP 请求，加速启动
+- **下载失败**：自动回退到本地缓存，不中断服务
+- **孤儿清理**：启动时自动删除配置中不再存在的 `id` 对应的缓存文件
 
 ## 匹配流程
 

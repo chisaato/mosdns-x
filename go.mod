@@ -7,6 +7,8 @@ require (
 	github.com/AdguardTeam/golibs v0.35.13
 	github.com/AdguardTeam/urlfilter v0.23.4
 	github.com/Knetic/govaluate v3.0.0+incompatible
+	github.com/dnstap/golang-dnstap v0.4.0
+	github.com/farsightsec/golang-framestream v0.3.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-viper/mapstructure/v2 v2.5.0

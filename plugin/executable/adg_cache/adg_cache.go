@@ -20,11 +20,11 @@ import (
 const PluginType = "adg_cache"
 
 const (
-	defaultSize             = 52428800 // 50MB
-	defaultPrefetchTTL      = 10
-	defaultStaleTTL         = 300
-	defaultOptimisticTTL    = 30
-	defaultPrefetchTimeout  = time.Second * 5
+	defaultSize            = 52428800 // 50MB
+	defaultPrefetchTTL     = 10
+	defaultStaleTTL        = 300
+	defaultOptimisticTTL   = 30
+	defaultPrefetchTimeout = time.Second * 5
 )
 
 // cache entry value layout:
@@ -85,7 +85,7 @@ func newAdgCachePlugin(bp *coremain.BP, args *Args) (*adgCachePlugin, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &adgCachePlugin{
-		BP: bp,
+		BP:   bp,
 		args: args,
 		items: glcache.New(glcache.Config{
 			MaxSize:   uint(args.Size),

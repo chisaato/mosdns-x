@@ -49,12 +49,12 @@ func init() {
 var _ coremain.ExecutablePlugin = (*echBlock)(nil)
 
 type Args struct {
-	ProbeDNS      string   `yaml:"probe_dns"`
-	ProbeTimeout  int      `yaml:"probe_timeout"`
-	BlockMode     string   `yaml:"block_mode"`
-	AllowDomains  []string `yaml:"allow_domains"`
-	CacheSize     int      `yaml:"cache_size"`
-	CacheTTL      int      `yaml:"cache_ttl"`
+	ProbeDNS     string   `yaml:"probe_dns"`
+	ProbeTimeout int      `yaml:"probe_timeout"`
+	BlockMode    string   `yaml:"block_mode"`
+	AllowDomains []string `yaml:"allow_domains"`
+	CacheSize    int      `yaml:"cache_size"`
+	CacheTTL     int      `yaml:"cache_ttl"`
 }
 
 type probeCacheEntry struct {
@@ -120,7 +120,7 @@ func newEchBlock(bp *coremain.BP, args *Args) (*echBlock, error) {
 		BP:      bp,
 		args:    args,
 		probeUp: probeUp,
-		cache: concurrent_lru.NewConecurrentLRU[string, *probeCacheEntry](cacheSize, nil),
+		cache:   concurrent_lru.NewConecurrentLRU[string, *probeCacheEntry](cacheSize, nil),
 	}
 
 	if len(args.AllowDomains) > 0 {

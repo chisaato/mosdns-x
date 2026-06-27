@@ -27,8 +27,18 @@ import (
 const PluginType = "adg_filter"
 
 func init() {
+	var err error
+	BlockedMark, err = query_context.AllocateMark()
+	if err != nil {
+		panic(fmt.Sprintf("adg_filter: %v", err))
+	}
 	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
 }
+
+// BlockedMark is set on query_context when this plugin decides to block a
+// query. Downstream plugins (e.g. observability) can check
+// qCtx.HasMark(BlockedMark) to determine whether the query was intercepted.
+var BlockedMark uint
 
 var _ coremain.ExecutablePlugin = (*adgFilter)(nil)
 
@@ -495,6 +505,7 @@ func (f *adgFilter) Exec(ctx context.Context, qCtx *query_context.Context, next 
 			zap.String("host", hostname),
 			zap.String("qtype", dns.Type(qtype).String()),
 		)
+		qCtx.AddMark(BlockedMark)
 		f.applyBlock(qCtx, q, qtype)
 		return nil
 	}

@@ -70,16 +70,16 @@ type Args struct {
 }
 
 type UpstreamConfig struct {
-	Addr               string `yaml:"addr"`                // required
-	HTTP3              bool   `yaml:"http3"`               // enable HTTP/3
+	Addr               string `yaml:"addr"`  // required
+	HTTP3              bool   `yaml:"http3"` // enable HTTP/3
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
-	Trusted            bool   `yaml:"trusted"`             // 未配置时第一个 upstream 强制 trusted
+	Trusted            bool   `yaml:"trusted"` // 未配置时第一个 upstream 强制 trusted
 }
 
 type rttStats struct {
-	mu        sync.Mutex
-	rttSum    float64 // 微秒累计
-	reqNum    float64
+	mu     sync.Mutex
+	rttSum float64 // 微秒累计
+	reqNum float64
 }
 
 func (s *rttStats) update(rtt time.Duration) {
@@ -111,7 +111,7 @@ type adgForward struct {
 	fastestAddr *fastip.FastestAddr
 
 	// load_balance 模式
-	rttLock   sync.Mutex
+	rttLock     sync.Mutex
 	rttStatsMap map[string]*rttStats
 }
 

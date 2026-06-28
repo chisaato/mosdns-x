@@ -26,23 +26,30 @@ plugins:
   - tag: block_ech
     type: ech_block
     args:
-      # 必填 - 内网 DNS 地址，用于 A 记录探测
+      # 必填 - 内网 DNS 地址
       probe_dns: "10.96.0.10:53"
 
-      # 可选 - 探测超时（毫秒），默认 500
+      # ── 以下均为可选 ──────────────────────────────
+
+      # 探测超时（毫秒），默认 500
       probe_timeout: 500
 
-      # 可选 - 阻断方式，默认 refused
-      #   refused  返回 REFUSED
-      #   nxdomain 返回 NXDOMAIN
-      #   empty    返回 NOERROR + 空 Answer
+      # Bootstrap DNS（纯 IP），用于解析 probe_dns 中的域名
+      # 若 probe_dns 是纯 IP 则无需配置
+      probe_bootstrap:
+        - "8.8.8.8:53"
+
+      # 跳过 TLS 证书校验（仅对 DoT/DoH/DoQ 有效）
+      probe_insecure_skip_verify: false
+
+      # 阻断方式，默认 refused
       block_mode: "refused"
 
-      # 可选 - 探测结果 LRU 缓存
-      cache_size: 10000          # 容量，默认 10000
-      cache_ttl: 60              # TTL 秒，默认 30
+      # 探测结果 LRU 缓存
+      cache_size: 10000
+      cache_ttl: 60
 
-      # 可选 - 白名单域名，支持 provider: 引用
+      # 白名单域名
       allow_domains:
         - "valid-ech.internal.example.com"
 ```
@@ -51,12 +58,30 @@ plugins:
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|:----:|:----:|------|
-| `probe_dns` | `string` | 是 | - | 内网 DNS 地址，如 `192.168.1.1:53`，省略端口时默认 53 |
+| `probe_dns` | `string` | 是 | - | 内网 DNS 地址，支持所有 dnsproxy 协议前缀 |
 | `probe_timeout` | `int` | 否 | 500 | 探测超时（毫秒） |
+| `probe_bootstrap` | `[]string` | 否 | 无 | 纯 IP DNS 地址列表，用于解析 `probe_dns` 中的域名。`probe_dns` 是纯 IP 时无效 |
+| `probe_insecure_skip_verify` | `bool` | 否 | false | 跳过 TLS 证书校验 |
 | `block_mode` | `string` | 否 | `refused` | 阻断方式：`refused` / `nxdomain` / `empty` |
 | `cache_size` | `int` | 否 | 10000 | 探测结果 LRU 缓存容量 |
 | `cache_ttl` | `int` | 否 | 30 | 缓存秒数 |
 | `allow_domains` | `[]string` | 否 | 无 | 白名单域名，支持 `provider:` 引用 |
+
+## 支持的协议
+
+`probe_dns` 使用 dnsproxy 的 `AddressToUpstream` 创建连接，支持所有 dnsproxy 协议：
+
+| Scheme | 协议 | 默认端口 | 示例 |
+|--------|------|:-------:|------|
+| 无 | 明文 UDP | 53 | `10.96.0.10:53` |
+| `udp://` | 明文 UDP | 53 | `udp://10.96.0.10:53` |
+| `tcp://` | 明文 TCP | 53 | `tcp://10.96.0.10:53` |
+| `tls://` | DNS-over-TLS | 853 | `tls://dns.internal` |
+| `https://` | DNS-over-HTTPS | 443 | `https://dns.internal/dns-query` |
+| `quic://` | DNS-over-QUIC | 853 | `quic://dns.internal` |
+| `sdns://` | DNS Stamp | 动态 | `sdns://...` |
+
+当 `probe_dns` 配置为域名（如 `tls://dns.service.internal`）时，需要配合 `probe_bootstrap` 提供纯 IP 的解析服务。`probe_bootstrap` 支持与上述相同的协议格式。
 
 ## 执行逻辑
 

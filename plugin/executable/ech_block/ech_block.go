@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -49,12 +50,14 @@ func init() {
 var _ coremain.ExecutablePlugin = (*echBlock)(nil)
 
 type Args struct {
-	ProbeDNS     string   `yaml:"probe_dns"`
-	ProbeTimeout int      `yaml:"probe_timeout"`
-	BlockMode    string   `yaml:"block_mode"`
-	AllowDomains []string `yaml:"allow_domains"`
-	CacheSize    int      `yaml:"cache_size"`
-	CacheTTL     int      `yaml:"cache_ttl"`
+	ProbeDNS               string   `yaml:"probe_dns"`
+	ProbeTimeout           int      `yaml:"probe_timeout"`
+	ProbeBootstrap         []string `yaml:"probe_bootstrap"`
+	ProbeInsecureSkipVerify bool    `yaml:"probe_insecure_skip_verify"`
+	BlockMode              string   `yaml:"block_mode"`
+	AllowDomains           []string `yaml:"allow_domains"`
+	CacheSize              int      `yaml:"cache_size"`
+	CacheTTL               int      `yaml:"cache_ttl"`
 }
 
 type probeCacheEntry struct {
@@ -105,13 +108,44 @@ func newEchBlock(bp *coremain.BP, args *Args) (*echBlock, error) {
 	}
 
 	probeAddr := args.ProbeDNS
-	if _, _, err := net.SplitHostPort(probeAddr); err != nil {
-		probeAddr = net.JoinHostPort(probeAddr, "53")
+	switch {
+	case strings.Contains(probeAddr, "://"):
+	default:
+		if _, _, err := net.SplitHostPort(probeAddr); err != nil {
+			probeAddr = net.JoinHostPort(probeAddr, "53")
+		}
 	}
 
-	probeUp, err := dnsproxy_upstream.AddressToUpstream(probeAddr, &dnsproxy_upstream.Options{
-		Timeout: timeout,
-	})
+	opts := &dnsproxy_upstream.Options{
+		Timeout:            timeout,
+		InsecureSkipVerify: args.ProbeInsecureSkipVerify,
+	}
+
+	if len(args.ProbeBootstrap) > 0 {
+		bsOpts := &dnsproxy_upstream.Options{
+			Timeout: timeout,
+		}
+		if len(args.ProbeBootstrap) == 1 {
+			r, err := dnsproxy_upstream.NewUpstreamResolver(args.ProbeBootstrap[0], bsOpts)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create bootstrap resolver %s: %w", args.ProbeBootstrap[0], err)
+			}
+			opts.Bootstrap = dnsproxy_upstream.NewCachingResolver(r)
+		} else {
+			var resolvers []dnsproxy_upstream.Resolver
+			for _, bs := range args.ProbeBootstrap {
+				r, err := dnsproxy_upstream.NewUpstreamResolver(bs, bsOpts)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create bootstrap resolver %s: %w", bs, err)
+				}
+				resolvers = append(resolvers, r)
+			}
+			pr := dnsproxy_upstream.ParallelResolver(resolvers)
+			opts.Bootstrap = &pr
+		}
+	}
+
+	probeUp, err := dnsproxy_upstream.AddressToUpstream(probeAddr, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init probe upstream: %w", err)
 	}

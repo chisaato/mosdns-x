@@ -53,4 +53,6 @@ func init() {
 	}
 	configCmd.AddCommand(newGenCmd(), newConvCmd())
 	coremain.AddSubCmd(configCmd)
+
+	coremain.AddSubCmd(newCompileAdsCmd())
 }

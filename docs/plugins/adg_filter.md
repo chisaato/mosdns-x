@@ -1,92 +1,131 @@
-# adg_filter
+# adg_filter — 广告域名拦截插件
 
-基于 `github.com/AdguardTeam/urlfilter` 的 DNS 过滤插件，对标 AdGuard Home 的过滤引擎。
+## 简介
 
-## 配置
+`adg_filter` 是一个 DNS 级广告/跟踪器域名拦截插件，使用 AdGuard 过滤列表语法。运行时使用 mosdns 域名 trie（SubDomainMatcher）匹配，无 urlfilter 运行时依赖。
+
+## 两大来源
+
+| 来源 | 字段 | 格式 | 加载方式 |
+|------|------|------|----------|
+| 过滤列表 | `block_lists` / `allow_lists` | `url:` value — `file://` 本地文件 或 `https://` 远程 | 下载/读取 → 去重 → 提取域名 → trie |
+| Mosdns 原生源 | `block_provider` / `allow_provider` | `[]string`，同 `query_matcher` 域名语法 | `BatchLoadDomainProvider` 统一加载 |
+
+**原生源语法**（同 `query_matcher` 的域名字段）：
+
+```yaml
+block_provider:
+  - "provider:ads_dat"           # data_providers tag → 自动检测文件格式
+  - "provider:ads_dat:ads"       # 指定 geosite tag 过滤
+  - "domain:example.com"         # inline domain 语法
+  - "custom-block-domain.com"    # 纯域名
+```
+
+两者自动合并到同一个 MatcherGroup，查询时先匹配过滤列表再匹配 provider。
+
+## 配置示例
+
+### 场景 1：纯 adblock list（本机测试）
 
 ```yaml
 plugins:
-  - tag: my_filter
+  - tag: block_ads
     type: adg_filter
     args:
-      # ── 拦截列表 ──────────────────────────────────────────────
       block_lists:
-        - url: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
-          name: "AdGuard DNS filter"
+        - url: file:///etc/mosdns/my_rules.txt   # 本地 adblock 文件
           id: 1
-        - url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.plus.txt"
-          name: "HaGeZi Pro++"
+        - url: https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
+          name: AdGuard DNS
           id: 2
-
-      # 手工填写的拦截规则 (AdBlock 语法或纯域名)
-      block_inline:
-        - "||evil.example.com^"
-        - "ads.example.net"
-        - "0.0.0.0 tracker.example.com"
-
-      # ── 白名单 ──────────────────────────────────────────────
-      allow_lists:
-        - url: "https://example.com/my-allowlist.txt"
-          name: "My allowlist"
-          id: 100
-
-      allow_inline:
-        - "@@||good-ads.example.com^"
-
-      # ── 阻断模式 ──────────────────────────────────────────────
-      block_mode: nxdomain      # nxdomain | refused | zero_ip | custom_ip
-      blocking_ipv4: "0.0.0.0" # zero_ip / custom_ip 时使用
-      blocking_ipv6: "::"
-
-      # 本地缓存目录（可选），启用后基于文件 mtime 判断缓存时效
-      cache_dir: "/var/lib/mosdns/adg_cache"
-
-      # 自动更新间隔（秒），默认 86400（24h）
+      block_mode: nxdomain
+      cache_dir: /var/cache/mosdns
       update_interval: 86400
 ```
 
-## 阻断模式
-
-| 模式 | 效果 |
-|------|------|
-| `nxdomain` | 返回 NXDOMAIN（默认） |
-| `refused` | 返回 REFUSED |
-| `zero_ip` | A → `0.0.0.0`，AAAA → `::` |
-| `custom_ip` | A → blocking_ipv4，AAAA → blocking_ipv6 |
-
-非 A/AAAA 查询在 IP 阻断模式下回退到 NXDOMAIN。
-
-## 规则来源
-
-- `block_lists` / `allow_lists`：从 URL 下载，定时自动更新
-- `block_inline` / `allow_inline`：内联规则，重启生效
-
-支持 AdBlock 语法（`||domain.com^`）、纯域名列表、hosts 格式。
-
-## 本地缓存
-
-配置 `cache_dir` 后可启用本地磁盘缓存：
+### 场景 2：纯 provider 源（局域网生产）
 
 ```yaml
-args:
-  cache_dir: "/var/lib/mosdns/adg_cache"
+data_providers:
+  - tag: ads_blob
+    file: /etc/mosdns/ads.dat
+    auto_reload: true
+  - tag: my_allow
+    file: /etc/mosdns/allowlist.txt
+    auto_reload: true
+
+plugins:
+  - tag: block_ads
+    type: adg_filter
+    args:
+      block_provider:
+        - "provider:ads_blob:ads"   # .dat + geosite tag
+      allow_provider:
+        - "provider:my_allow"       # 纯文本域名列表
+      block_mode: nxdomain
 ```
 
-- **文件名**：每个过滤列表的 `id` + `.txt`，例 `1.txt`、`2.txt`，与 AdGuard Home 惯例一致
-- **缓存时效**：文件 mtime + `update_interval` 还在有效期内 → 完全不发 HTTP 请求，加速启动
-- **下载失败**：自动回退到本地缓存，不中断服务
-- **孤儿清理**：启动时自动删除配置中不再存在的 `id` 对应的缓存文件
+### 场景 3：混合（云服务器）
 
-## 匹配流程
+```yaml
+data_providers:
+  - tag: ads_blob
+    file: /etc/mosdns/ads.dat
+    auto_reload: true
 
+plugins:
+  - tag: block_ads
+    type: adg_filter
+    args:
+      block_provider:
+        - "provider:ads_blob:ads"             # .dat 主力
+      block_lists:
+        - url: file:///etc/mosdns/manual_rules.txt   # 手写 adblock 补充
+          id: 99
+      allow_lists:
+        - url: file:///etc/mosdns/emergency_allow.txt
+          id: 100
+      block_mode: nxdomain
+      cache_dir: /var/cache/mosdns
 ```
-收到 DNS 请求
-  ├─ allow engine 匹配 → 放行（调 next）
-  ├─ block engine 匹配 → 阻断（拦截响应，不调 next）
-  └─ 均不匹配 → 放行（调 next）
+
+## 内存与性能
+
+| 200w+ 域名 | 内存 | 启动时间 |
+|-----------|------|---------|
+| block_lists（text → trie） | 100-150 MB | 首次 10-20s，缓存 3-5s |
+| block_provider（.dat → trie） | 25-40 MB | 2-5s |
+
+- 所有域名最终进入 `SubDomainMatcher` trie，查询 O(label 数量)，与规则总数无关
+- `cache_dir` 会缓存提取后的域名文本（`adg_filter_block.domains`），重启时跳过解析步骤
+
+## 热重载
+
+- `block_lists`：`update_interval` 定时重建，通过 DynamicMatcher 原子更新
+- `block_provider`：data_providers `auto_reload: true` + fsnotify → DynamicMatcher 自动热更新
+- 两者独立更新，互不影响，无需重启 mosdns
+
+## CLI: `mosdns compile-ads`
+
+从 mosdns 配置提取 `adg_filter` 插件的 `block_lists`，编译为 geosite `.dat` 文件。
+
+```bash
+mosdns compile-ads -c mosdns.yaml -o ads.dat            # 默认 tag=ads
+mosdns compile-ads -c mosdns.yaml -f block_ads -o ads.dat  # 指定插件 tag
+mosdns compile-ads -c mosdns.yaml -t category-ads -o ads.dat  # 指定 geosite tag
+mosdns compile-ads -c mosdns.yaml -f my_filter -t gfw -o gfw.dat
 ```
 
-## URL 自动更新
+## 参数参考
 
-启动时同步下载所有 URL 列表，合并到 `urlfilter.DNSEngine`。
-后台按 `update_interval` 定时刷新，下载失败保留旧引擎不中断服务。
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `block_lists` | list | `[]` | 过滤列表：`url:` 值为 `file://`（本地）或 `https://`（远程） |
+| `block_provider` | list | `[]` | `[]string`，同 query_matcher 域名语法 |
+| `allow_lists` | list | `[]` | 允许列表 |
+| `allow_provider` | list | `[]` | `[]string`，同 query_matcher 域名语法 |
+| `block_mode` | string | `"nxdomain"` | `nxdomain` / `refused` / `zero_ip` / `custom_ip` |
+| `blocking_ipv4` | string | `"0.0.0.0"` | custom_ip 模式的 IPv4 |
+| `blocking_ipv6` | string | `"::"` | custom_ip 模式的 IPv6 |
+| `update_interval` | int | `86400` | 后台刷新间隔（秒） |
+| `cache_dir` | string | `""` | 缓存目录 |

@@ -104,7 +104,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
-	key, err := f.getCacheKey(q)
+	key, err := f.getCacheKey(q, qCtx.ReqMeta().GetClientID())
 	if err != nil {
 		f.L().Warn("adg_cache: get msg key", qCtx.InfoField(), zap.Error(err))
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
@@ -264,8 +264,9 @@ func unpackCacheValue(val []byte) (msg *dns.Msg, expiry uint32, err error) {
 // (buffer size, DO bit, etc.) don't fragment the cache. If the
 // query carries an EDNS Client Subnet (ECS) option, the subnet
 // fields are appended to the key so different subnets get separate
-// cache entries.
-func (f *adgCachePlugin) getCacheKey(q *dns.Msg) (string, error) {
+// cache entries. clientID (e.g. from DoH URL path) is also
+// appended to differentiate cached results per client profile.
+func (f *adgCachePlugin) getCacheKey(q *dns.Msg, clientID string) (string, error) {
 	m := q.Copy()
 
 	var ecsBytes []byte
@@ -286,6 +287,11 @@ func (f *adgCachePlugin) getCacheKey(q *dns.Msg) (string, error) {
 
 	if ecsBytes != nil {
 		wire = append(wire, ecsBytes...)
+	}
+
+	if clientID != "" {
+		wire = append(wire, 0)
+		wire = append(wire, clientID...)
 	}
 
 	return string(wire), nil

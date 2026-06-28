@@ -104,7 +104,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
-	key, err := dnsutils.GetMsgKey(q, 0)
+	key, err := f.getCacheKey(q)
 	if err != nil {
 		f.L().Warn("adg_cache: get msg key", qCtx.InfoField(), zap.Error(err))
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
@@ -255,8 +255,74 @@ func unpackCacheValue(val []byte) (msg *dns.Msg, expiry uint32, err error) {
 	return msg, expiry, nil
 }
 
+// isCacheable checks whether the query should participate in caching.
+// Unlike the original check, EDNS0 OPT records are allowed because
+// virtually all modern DNS queries carry them. Only non-OPT Extra
+// records (TSIG, SIG(0), etc.) will reject caching.
+// getCacheKey generates a cache key from the query.
+// OPT record is stripped before packing so that EDNS0 variations
+// (buffer size, DO bit, etc.) don't fragment the cache. If the
+// query carries an EDNS Client Subnet (ECS) option, the subnet
+// fields are appended to the key so different subnets get separate
+// cache entries.
+func (f *adgCachePlugin) getCacheKey(q *dns.Msg) (string, error) {
+	m := q.Copy()
+
+	var ecsBytes []byte
+	if opt := m.IsEdns0(); opt != nil {
+		if ecs := dnsutils.GetECS(opt); ecs != nil {
+			ecsBytes = packECSKey(ecs)
+		}
+		m.Extra = removeOPT(m.Extra)
+	}
+
+	wire, err := m.Pack()
+	if err != nil {
+		return "", err
+	}
+
+	wire[0] = 0
+	wire[1] = 0
+
+	if ecsBytes != nil {
+		wire = append(wire, ecsBytes...)
+	}
+
+	return string(wire), nil
+}
+
+// removeOPT removes the OPT (EDNS0) pseudo-record from the Extra section.
+func removeOPT(extra []dns.RR) []dns.RR {
+	for i, e := range extra {
+		if e.Header().Rrtype == dns.TypeOPT {
+			return append(extra[:i], extra[i+1:]...)
+		}
+	}
+	return extra
+}
+
+// packECSKey serializes the ECS subnet fields into bytes for the cache key.
+func packECSKey(ecs *dns.EDNS0_SUBNET) []byte {
+	addrLen := len(ecs.Address)
+	b := make([]byte, 4+addrLen)
+	binary.BigEndian.PutUint16(b[0:2], ecs.Family)
+	b[2] = ecs.SourceNetmask
+	b[3] = ecs.SourceScope
+	copy(b[4:], ecs.Address)
+	return b
+}
+
 func isCacheable(q *dns.Msg) bool {
-	return len(q.Question) == 1 && len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0
+	if len(q.Question) != 1 || len(q.Answer) != 0 || len(q.Ns) != 0 {
+		return false
+	}
+	// Allow only OPT (EDNS0) pseudo-record in Extra; reject TSIG, etc.
+	for _, e := range q.Extra {
+		if e.Header().Rrtype != dns.TypeOPT {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *adgCachePlugin) Close() error {

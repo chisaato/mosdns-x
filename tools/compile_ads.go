@@ -14,8 +14,8 @@ import (
 
 	"github.com/pmkol/mosdns-x/coremain"
 	"github.com/pmkol/mosdns-x/mlog"
-	adg "github.com/pmkol/mosdns-x/plugin/executable/adg_filter"
 	"github.com/pmkol/mosdns-x/pkg/matcher/v2data"
+	adg "github.com/pmkol/mosdns-x/plugin/executable/adg_filter"
 )
 
 func newCompileAdsCmd() *cobra.Command {

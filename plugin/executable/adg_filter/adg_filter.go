@@ -1,6 +1,7 @@
 package adg_filter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -159,27 +160,102 @@ func newAdgFilter(bp *coremain.BP, args *Args) (*adgFilter, error) {
 	return f, nil
 }
 
+// dedupRules deduplicates actual filtering rules across multiple byte sources.
+// Comments (!, #) and empty lines are stripped — urlfilter's RuleScanner would
+// skip them anyway, so keeping them just wastes memory.
+//
+// Each element in sources is raw rule text (newline-separated). The returned
+// []byte contains one deduplicated rule per line, ready to pass to
+// filterlist.NewBytes.
+func dedupRules(sources ...[]byte) []byte {
+	total := 0
+	for _, s := range sources {
+		total += len(s)
+	}
+	// A reasonable lower bound: after stripping comments + dedup we'll
+	// usually land somewhere between 50 % and 80 % of total.
+	buf := bytes.NewBuffer(make([]byte, 0, total*3/4))
+	seen := make(map[string]struct{}, total/64) // ~64 B per rule on average
+
+	for _, src := range sources {
+		for _, line := range bytes.Split(src, []byte{'\n'}) {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) == 0 || trimmed[0] == '!' || trimmed[0] == '#' {
+				continue
+			}
+			key := string(trimmed)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			buf.Write(trimmed)
+			buf.WriteByte('\n')
+		}
+	}
+
+	return buf.Bytes()
+}
+
+// compiledCachePath returns the path to the compiled (deduplicated) cache file.
+func (f *adgFilter) compiledCachePath(baseID rules.ListID) string {
+	if f.args.CacheDir == "" {
+		return ""
+	}
+	return filepath.Join(f.args.CacheDir, fmt.Sprintf("compiled_%d.txt", baseID))
+}
+
+// loadCompiled tries to read a valid compiled cache. Returns (nil, false) if
+// missing, expired, or unreadable.
+func (f *adgFilter) loadCompiled(baseID rules.ListID) ([]byte, bool) {
+	path := f.compiledCachePath(baseID)
+	if path == "" || !f.isCacheValid(path) {
+		return nil, false
+	}
+	data, err := f.readCacheFile(path)
+	if err != nil {
+		return nil, false
+	}
+	f.L().Info("loaded compiled dedup cache",
+		zap.String("path", filepath.Base(path)),
+		zap.Int("bytes", len(data)),
+	)
+	return data, true
+}
+
+// buildEngineFromCompiled creates a DNSEngine from already deduplicated rule text.
+func (f *adgFilter) buildEngineFromCompiled(merged []byte, baseID rules.ListID) *urlfilter.DNSEngine {
+	if len(merged) == 0 {
+		storage, _ := filterlist.NewRuleStorage(nil)
+		return urlfilter.NewDNSEngine(storage)
+	}
+	b := filterlist.NewBytes(&filterlist.BytesConfig{
+		ID:             baseID,
+		RulesText:      merged,
+		IgnoreCosmetic: true,
+	})
+	storage, err := filterlist.NewRuleStorage([]filterlist.Interface{b})
+	if err != nil {
+		_ = b.Close()
+		storage, _ = filterlist.NewRuleStorage(nil)
+	}
+	return urlfilter.NewDNSEngine(storage)
+}
+
 // buildEngineCached builds a urlfilter.DNSEngine from cache only (no HTTP).
-// URL lists missing from cache are silently skipped so startup never blocks.
+// First tries the compiled (deduplicated) cache; falls back to individual
+// list caches + global dedup on miss or expiry.
 func (f *adgFilter) buildEngineCached(
 	urls []FilterListConfig,
 	inline []string,
 	baseID rules.ListID,
 ) *urlfilter.DNSEngine {
-	var lists []filterlist.Interface
-	id := baseID
-
-	if len(inline) > 0 {
-		text := strings.Join(inline, "\n")
-		s := filterlist.NewString(&filterlist.StringConfig{
-			ID:             id,
-			RulesText:      text,
-			IgnoreCosmetic: true,
-		})
-		lists = append(lists, s)
-		id++
+	if compiled, ok := f.loadCompiled(baseID); ok {
+		return f.buildEngineFromCompiled(compiled, baseID)
 	}
-
+	sources := make([][]byte, 0, 1+len(urls))
+	if len(inline) > 0 {
+		sources = append(sources, []byte(strings.Join(inline, "\n")))
+	}
 	for _, uc := range urls {
 		path := f.cachePath(uc.ID)
 		if path == "" {
@@ -193,59 +269,41 @@ func (f *adgFilter) buildEngineCached(
 			)
 			continue
 		}
-		b := filterlist.NewBytes(&filterlist.BytesConfig{
-			ID:             id,
-			RulesText:      data,
-			IgnoreCosmetic: true,
-		})
-		lists = append(lists, b)
+		sources = append(sources, data)
 		f.L().Info("loaded filter list from cache",
 			zap.Int("id", uc.ID),
 			zap.String("name", uc.Name),
 			zap.Int("bytes", len(data)),
 		)
-		id++
 	}
 
-	if len(lists) == 0 {
-		storage, _ := filterlist.NewRuleStorage(nil)
-		return urlfilter.NewDNSEngine(storage)
-	}
+	merged := dedupRules(sources...)
 
-	storage, err := filterlist.NewRuleStorage(lists)
-	if err != nil {
-		for _, l := range lists {
-			_ = l.Close()
+	if path := f.compiledCachePath(baseID); path != "" && len(merged) > 0 {
+		if err := f.writeCacheFile(path, merged); err != nil {
+			f.L().Warn("failed to save compiled cache", zap.Error(err))
 		}
-		storage, _ := filterlist.NewRuleStorage(nil)
-		return urlfilter.NewDNSEngine(storage)
 	}
-	return urlfilter.NewDNSEngine(storage)
+
+	return f.buildEngineFromCompiled(merged, baseID)
 }
 
 // buildEngine creates a urlfilter.DNSEngine from URL lists and inline rules.
-// It always re-downloads URL lists (no cache path). baseID is the starting ListID prefix.
+// First tries the compiled (deduplicated) cache; falls back to re-download +
+// global dedup on miss or expiry. Produces a fresh compiled cache for next use.
 func (f *adgFilter) buildEngine(
 	urls []FilterListConfig,
 	inline []string,
 	baseID rules.ListID,
 ) (*urlfilter.DNSEngine, error) {
-	var lists []filterlist.Interface
-	id := baseID
-
-	// Inline rules (user-manual custom rules).
-	if len(inline) > 0 {
-		text := strings.Join(inline, "\n")
-		s := filterlist.NewString(&filterlist.StringConfig{
-			ID:             id,
-			RulesText:      text,
-			IgnoreCosmetic: true,
-		})
-		lists = append(lists, s)
-		id++
+	if compiled, ok := f.loadCompiled(baseID); ok {
+		return f.buildEngineFromCompiled(compiled, baseID), nil
 	}
 
-	// URL-based filter lists (downloaded).
+	sources := make([][]byte, 0, 1+len(urls))
+	if len(inline) > 0 {
+		sources = append(sources, []byte(strings.Join(inline, "\n")))
+	}
 	for _, uc := range urls {
 		data, err := f.downloadURL(uc.URL, uc.ID)
 		if err != nil {
@@ -257,37 +315,23 @@ func (f *adgFilter) buildEngine(
 			)
 			continue
 		}
-		b := filterlist.NewBytes(&filterlist.BytesConfig{
-			ID:             id,
-			RulesText:      data,
-			IgnoreCosmetic: true,
-		})
-		lists = append(lists, b)
+		sources = append(sources, data)
 		f.L().Info("filter list loaded",
 			zap.Int("id", uc.ID),
 			zap.String("name", uc.Name),
 			zap.Int("bytes", len(data)),
 		)
-		id++
 	}
 
-	if len(lists) == 0 {
-		storage, err := filterlist.NewRuleStorage(nil)
-		if err != nil {
-			return nil, err
+	merged := dedupRules(sources...)
+
+	if path := f.compiledCachePath(baseID); path != "" && len(merged) > 0 {
+		if err := f.writeCacheFile(path, merged); err != nil {
+			f.L().Warn("failed to save compiled cache", zap.Error(err))
 		}
-		return urlfilter.NewDNSEngine(storage), nil
 	}
 
-	storage, err := filterlist.NewRuleStorage(lists)
-	if err != nil {
-		for _, l := range lists {
-			_ = l.Close()
-		}
-		return nil, fmt.Errorf("failed to create rule storage: %w", err)
-	}
-
-	return urlfilter.NewDNSEngine(storage), nil
+	return f.buildEngineFromCompiled(merged, baseID), nil
 }
 
 func (f *adgFilter) cachePath(id int) string {
@@ -335,6 +379,9 @@ func (f *adgFilter) cleanOrphanCaches(activeIDs []int) {
 		}
 		p := filepath.Join(f.args.CacheDir, e.Name())
 		if _, keep := activeSet[p]; !keep {
+			if strings.HasPrefix(e.Name(), "compiled_") {
+				continue
+			}
 			if err := os.Remove(p); err == nil {
 				f.L().Debug("removed orphan cache file", zap.String("file", e.Name()))
 			}

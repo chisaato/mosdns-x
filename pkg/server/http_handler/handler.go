@@ -141,14 +141,9 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 		if path != h.opts.Path {
 			prefix := h.opts.Path + "/"
 			if strings.HasPrefix(path, prefix) {
-				// mosdns-x: extract client ID from path suffix
-				if id := path[len(prefix):]; id != "" {
-					// only take the first segment
-					if idx := strings.IndexByte(id, '/'); idx > 0 {
-						id = id[:idx]
-					}
-					meta.SetClientID(id)
-				}
+				// mosdns-x: extract all client IDs from path suffix
+				// (e.g. /dns-query/idA/idB -> ["idA", "idB"]).
+				meta.SetClientIDs(parseClientIDs(req.URL(), h.opts.Path))
 			} else {
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte("invalid request path"))
@@ -259,6 +254,43 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 		h.warnErr(req, fmt.Errorf("write response failed: %s", err))
 		return
 	}
+}
+
+// parseClientIDs extracts all client IDs from the path suffix after prefix.
+// It splits on "/" and URL-decodes each segment. Empty segments are dropped,
+// so /dns-query/a//b/ yields ["a", "b"].
+//
+// u.RawPath is preferred for splitting when present: the decoded Path cannot
+// distinguish a literal "/" from an encoded "%2F", while RawPath can.
+// Therefore /dns-query/a%2Fb yields the single ID "a/b" and
+// /dns-query/a/b yields the two IDs ["a", "b"].
+func parseClientIDs(u *url.URL, prefix string) []string {
+	path := u.Path
+	if u.RawPath != "" && strings.HasPrefix(u.RawPath, prefix) {
+		path = u.RawPath
+	}
+	prefixSlash := prefix + "/"
+	if !strings.HasPrefix(path, prefixSlash) {
+		return nil
+	}
+	suffix := path[len(prefixSlash):] // skip prefix and the following "/"
+	if suffix == "" {
+		return nil
+	}
+	segments := strings.Split(suffix, "/")
+	ids := make([]string, 0, len(segments))
+	for _, s := range segments {
+		if s == "" {
+			continue
+		}
+		if dec, err := url.PathUnescape(s); err == nil {
+			s = dec
+		}
+		if s != "" {
+			ids = append(ids, s)
+		}
+	}
+	return ids
 }
 
 func getRemoteAddr(req Request, customHeader string) (netip.Addr, error) {

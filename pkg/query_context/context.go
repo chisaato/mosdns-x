@@ -54,8 +54,9 @@ type RequestMeta struct {
 
 	protocol string
 
-	// mosdns-x: clientID extracted from URL path prefix (e.g. /dns-query/family -> "family").
-	clientID string
+	// mosdns-x: clientIDs extracted from URL path prefix (e.g. /dns-query/family -> ["family"],
+	// /dns-query/idA/idB -> ["idA", "idB"]). Each path segment is one client ID.
+	clientIDs []string
 }
 
 func NewRequestMeta(addr netip.Addr) *RequestMeta {
@@ -94,12 +95,33 @@ func (m *RequestMeta) GetServerName() string {
 	return m.serverName
 }
 
+// SetClientID sets a single client ID. It is kept for backward compatibility
+// and is equivalent to SetClientIDs([]string{clientID}).
 func (m *RequestMeta) SetClientID(clientID string) {
-	m.clientID = clientID
+	if clientID == "" {
+		m.clientIDs = nil
+		return
+	}
+	m.clientIDs = []string{clientID}
 }
 
+// GetClientID returns the first client ID, or "" if there is none.
+// It is kept for backward compatibility. Use GetClientIDs for all IDs.
 func (m *RequestMeta) GetClientID() string {
-	return m.clientID
+	if len(m.clientIDs) == 0 {
+		return ""
+	}
+	return m.clientIDs[0]
+}
+
+// SetClientIDs sets all client IDs extracted from the URL path.
+func (m *RequestMeta) SetClientIDs(clientIDs []string) {
+	m.clientIDs = clientIDs
+}
+
+// GetClientIDs returns all client IDs extracted from the URL path.
+func (m *RequestMeta) GetClientIDs() []string {
+	return m.clientIDs
 }
 
 // Context is a query context that pass through plugins

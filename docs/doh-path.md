@@ -13,14 +13,42 @@ AdGuard Home 等 DNS 过滤软件支持在同一 DoH 端口上按 URL 路径区�
 
 假设 `url_path: /dns-query`：
 
-| 请求 path | clientID | 行为 |
-|-----------|----------|------|
-| `/dns-query` | `""`（空） | 走默认流程，不触发任何 `client_matcher` |
-| `/dns-query/family` | `"family"` | 可被 `client_matcher` 匹配 |
-| `/dns-query/family/child` | `"family"` | 只取第一段路径 |
+| 请求 path | clientIDs | 行为 |
+|-----------|-----------|------|
+| `/dns-query` | `[]`（空） | 走默认流程，不触发任何 `client_matcher` |
+| `/dns-query/family` | `["family"]` | 可被 `client_matcher` 匹配 |
+| `/dns-query/edu/cn` | `["edu", "cn"]` | 两个 ID 均可被分别匹配，或配合 `match_all` 同时匹配 |
+| `/dns-query/a//b/` | `["a", "b"]` | 空段被忽略 |
 | `/other` | — | 404（无关路径被拒绝） |
 
+路径段数量不限。每个段会做 URL 解码：`/dns-query/a%2Fb` 中的 `%2F` 解码为 `/`，得到单个 ID `"a/b"`（不会被误拆成两个段）。
+
 当 `url_path` 为空时，不执行任何提取，完全向后兼容。
+
+## 匹配语义：ANY 与 match_all
+
+`client_matcher` 默认是 **ANY** 语义：路径中的任意一个 ID 命中配置列表即匹配（与单 ID 时代行为一致）：
+
+```yaml
+# /dns-query/edu/cn 会命中（edu 命中）；/dns-query/other 不命中
+- tag: is_edu
+  type: client_matcher
+  args:
+    client_id: ["edu"]
+```
+
+设置 `match_all: true` 后变为 **ALL** 语义：配置列表中的每个 ID 都必须出现在路径中（路径可含额外 ID）：
+
+```yaml
+# 仅当路径同时含 edu 和 cn 时命中：/dns-query/edu/cn ✓，/dns-query/edu ✗
+- tag: is_edu_cn
+  type: client_matcher
+  args:
+    client_id: ["edu", "cn"]
+    match_all: true
+```
+
+`match_all` 与 `if` 表达式的等价关系、以及如何组合多个 matcher 构造复杂条件，见下文「复杂逻辑：if 表达式组合」。
 
 ## 配置示例
 
@@ -36,6 +64,13 @@ plugins:
     type: client_matcher
     args:
       client_id: ["adult"]
+
+  # 多 ID 组合：路径同时含 edu 与 cn 才命中
+  - tag: is_edu_cn
+    type: client_matcher
+    args:
+      client_id: ["edu", "cn"]
+      match_all: true
 
   # 客户端 A 的上游
   - tag: forward_family
@@ -64,6 +99,8 @@ plugins:
           exec: forward_family
         - if: is_adult
           exec: forward_adult
+        - if: is_edu_cn
+          exec: forward_edu_cn
         - exec: forward_default
 
 servers:
@@ -82,24 +119,59 @@ servers:
 curl -H "Accept: application/dns-message" 'https://example.com/dns-query?dns=...'     # 默认
 curl -H "Accept: application/dns-message" 'https://example.com/dns-query/family?dns=...'  # family
 curl -H "Accept: application/dns-message" 'https://example.com/dns-query/adult?dns=...'   # adult
+curl -H "Accept: application/dns-message" 'https://example.com/dns-query/edu/cn?dns=...'  # edu+cn
 ```
 
-## 搭配其他匹配条件
+## 复杂逻辑：if 表达式组合
 
-`client_matcher` 可与其他匹配器组合，实现更精细的分流，例如按客户端 IP + clientID 组合判断：
+`if:` 接受 **govaluate 布尔表达式**，表达式的变量就是已注册 matcher 的 tag，支持 `&&`（且）、`||`（或）、`!`（非）和括号任意嵌套。因此不必为每种组合定义专门 matcher，用多个"原子 matcher"（单 ID 或 `match_all` 的 `client_matcher`，以及 IP/域名等任意 matcher）即可构造任意复杂条件：
 
 ```yaml
-# 只有来自内网且 clientID 为 family 的请求才走 family 上游
-- if: _and
-  args:
-    - tag: is_family
-    - tag: is_private_ip
+plugins:
+  # 原子 matcher：每个 ID 一个
+  - tag: is_edu
+    type: client_matcher
+    args:
+      client_id: ["edu"]
+  - tag: is_cn
+    type: client_matcher
+    args:
+      client_id: ["cn"]
+  - tag: is_family
+    type: client_matcher
+    args:
+      client_id: ["family"]
+
+# 组合使用（在 sequence 的 exec 里）：
+- if: is_family && is_private_ip        # 内网且 family → 走 family 上游
   exec: forward_family
+- if: is_edu || is_cn                   # edu 或 cn 任一命中
+  exec: forward_edu_or_cn
+- if: !is_family                        # 非 family 客户端
+  exec: forward_non_family
+- if: (is_edu && is_cn) || is_family    # 任意嵌套
+  exec: forward_complex
 ```
+
+注意：表达式中的 matcher tag 需以字母、数字、下划线命名（govaluate 变量名规则），否则无法作为变量引用。
+
+### 与 match_all 的关系（共存）
+
+`match_all` 与 `if` 表达式是**等价简写**关系，可按习惯混用：
+
+| 写法 | 等价于 |
+|------|--------|
+| `client_id: ["edu", "cn"]`（默认 ANY） | `if: is_edu \|\| is_cn` |
+| `client_id: ["edu", "cn"], match_all: true` | `if: is_edu && is_cn` |
+
+- 高频、固定的组合 → 用 `match_all` 内联，少定义 tag、配置短
+- 否定、跨 matcher 嵌套、一次性复杂判断 → 用 `if:` 表达式组合原子 matcher
+- 两种 matcher 都可以继续被 `if:` 表达式引用组合（如 `if: is_edu_cn && !is_family`）
 
 ## 实现原理
 
-- `pkg/query_context/context.go` — `RequestMeta` 新增 `clientID` 字段
-- `pkg/server/http_handler/handler.go` — `ServeHTTP()` 中 URL path 前缀匹配后提取路径后缀作为 `clientID`
+- `pkg/query_context/context.go` — `RequestMeta` 新增 `clientIDs []string` 字段，提供 `SetClientIDs` / `GetClientIDs`（保留 `GetClientID` 返回第一个 ID，向后兼容）
+- `pkg/server/http_handler/handler.go` — `ServeHTTP()` 中 URL path 前缀匹配后，将路径后缀按 `/` 拆分为多个 `clientID`（优先使用 `RawPath` 分割再逐段解码，避免 `%2F` 被误拆）
 - `pkg/matcher/elem/str.go` — 通用字符串匹配器
-- `plugin/matcher/client_matcher/` — `client_matcher` 插件，匹配 `qCtx.ReqMeta().GetClientID()`
+- `plugin/matcher/client_matcher/` — `client_matcher` 插件，匹配 `qCtx.ReqMeta().GetClientIDs()`，支持 `match_all` 选项
+- `plugin/executable/adg_cache/` — 缓存键使用完整 ID 列表（`/` 连接），避免不同 ID 组合串缓存

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"time"
 
 	glcache "github.com/AdguardTeam/golibs/cache"
@@ -104,7 +105,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
-	key, err := f.getCacheKey(q, qCtx.ReqMeta().GetClientID())
+	key, err := f.getCacheKey(q, strings.Join(qCtx.ReqMeta().GetClientIDs(), "/"))
 	if err != nil {
 		f.L().Warn("adg_cache: get msg key", qCtx.InfoField(), zap.Error(err))
 		return executable_seq.ExecChainNode(ctx, qCtx, next)

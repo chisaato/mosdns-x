@@ -195,7 +195,8 @@ func (b *echBlock) Exec(ctx context.Context, qCtx *query_context.Context, next e
 
 	blocked, err := b.lookup(qName)
 	if err != nil {
-		b.L().Warn("probe failed, pass through",
+		b.L().Warn(
+			"probe failed, pass through",
 			zap.String("qname", qName),
 			zap.String("probe_dns", b.args.ProbeDNS),
 			zap.Error(err),
@@ -207,7 +208,8 @@ func (b *echBlock) Exec(ctx context.Context, qCtx *query_context.Context, next e
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
-	b.L().Info("blocked TYPE65",
+	b.L().Info(
+		"blocked TYPE65",
 		zap.String("qname", qName),
 		zap.String("probe_dns", b.args.ProbeDNS),
 	)
@@ -227,10 +229,12 @@ func (b *echBlock) lookup(qName string) (bool, error) {
 		return false, err
 	}
 
-	b.cache.Add(qName, &probeCacheEntry{
-		blocked:  blocked,
-		expireAt: now.Add(time.Duration(b.args.CacheTTL) * time.Second),
-	})
+	b.cache.Add(
+		qName, &probeCacheEntry{
+			blocked:  blocked,
+			expireAt: now.Add(time.Duration(b.args.CacheTTL) * time.Second),
+		},
+	)
 	return blocked, nil
 }
 
@@ -271,7 +275,12 @@ func (b *echBlock) block(qCtx *query_context.Context) {
 		r.RecursionAvailable = true
 		qCtx.SetResponse(r)
 	default:
-		r := dnsutils.GenEmptyReply(q, dns.RcodeRefused)
+		// 这才是安全的阻断 HTTPS/TYPE65 的方式
+		// 也就是用空响应和 RCODE=0 进行返回
+		// 不能用 nxdomain
+		r := new(dns.Msg)
+		r.SetRcode(q, dns.RcodeSuccess)
+		r.RecursionAvailable = true
 		qCtx.SetResponse(r)
 	}
 }

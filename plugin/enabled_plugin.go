@@ -51,6 +51,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/sequence"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/sleep"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ttl"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/tunnel_accelerate"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/client_matcher"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/mac_matcher"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/query_matcher"

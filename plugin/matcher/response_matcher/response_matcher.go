@@ -43,6 +43,10 @@ func init() {
 	coremain.RegNewPersetPluginFunc("_response_valid_answer", func(bp *coremain.BP) (coremain.Plugin, error) {
 		return &hasValidAnswer{BP: bp}, nil
 	})
+
+	coremain.RegNewPersetPluginFunc("_response_noerror", func(bp *coremain.BP) (coremain.Plugin, error) {
+		return &hasNoError{BP: bp}, nil
+	})
 }
 
 var _ coremain.MatcherPlugin = (*responseMatcher)(nil)
@@ -160,4 +164,15 @@ func (e *hasValidAnswer) match(qCtx *query_context.Context) (matched bool) {
 
 func (e *hasValidAnswer) Match(_ context.Context, qCtx *query_context.Context) (matched bool, err error) {
 	return e.match(qCtx), nil
+}
+
+type hasNoError struct {
+	*coremain.BP
+}
+
+var _ coremain.MatcherPlugin = (*hasNoError)(nil)
+
+func (e *hasNoError) Match(_ context.Context, qCtx *query_context.Context) (matched bool, err error) {
+	r := qCtx.R()
+	return r != nil && r.Rcode == dns.RcodeSuccess, nil
 }

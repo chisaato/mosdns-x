@@ -175,3 +175,18 @@ plugins:
 - `pkg/matcher/elem/str.go` — 通用字符串匹配器
 - `plugin/matcher/client_matcher/` — `client_matcher` 插件，匹配 `qCtx.ReqMeta().GetClientIDs()`，支持 `match_all` 选项
 - `plugin/executable/adg_cache/` — 缓存键使用完整 ID 列表（`/` 连接），避免不同 ID 组合串缓存
+
+## 跨节点转发：client_id 透传
+
+多节点部署时，边缘节点可用 `adg_forward` 的 `client_id_passthrough` 开关把
+本机收到的 clientIDs 动态拼接到出站 URL path，中枢节点无需任何改动即可按
+同样语义路由：
+
+```
+客户端 → 边缘: /dns-query/accel/international
+边缘   → 中枢: https://hub:4215/dns-query/accel/international
+```
+
+tag 集合任意组合、顺序无关，无需为组合枚举上游；详见
+[`adg_forward`](./plugins/adg_forward.md#client_id-透传多节点转发) 与
+[`scenarios/hub-edge.md`](./scenarios/hub-edge.md)。

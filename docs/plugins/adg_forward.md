@@ -29,6 +29,15 @@ plugins:
 
       # 全局超时（秒），默认 5
       timeout: 10
+
+      # ── client_id 出站透传（多节点转发）─────────────────────
+      # 把请求元数据中的 clientIDs 以 path 段形式追加到每个 upstream
+      # addr 的路径后（/dns-query + "/" + id1 + "/" + id2 ...），
+      # 用于边缘节点向中枢转发时保留客户端身份，供中枢按 tag 路由。
+      # 默认 false（行为与不配置时完全一致）
+      # client_id_passthrough: true
+      # 每个"不同 client_id 集合"懒构建一组变体 upstream，LRU 缓存容量
+      # passthrough_cache_size: 16
 ```
 
 ## UpstreamConfig
@@ -65,6 +74,23 @@ plugins:
 - 支持任意纯 IP 协议：`1.12.12.12:53`、`https://1.12.12.12/dns-query`、`tls://1.12.12.12`
 - 单 bootstrap 时自动用 CachingResolver 包装，缓存 DNS 解析结果
 - 不配置 bootstrap 时使用系统默认 DNS 解析器
+
+## client_id 透传（多节点转发）
+
+`client_id_passthrough: true` 时，出站请求会把客户端带来的 client_id 集合
+动态拼接到 upstream URL 的 path 后（见 [`doh-path.md`](../doh-path.md)）：
+
+```
+客户端 → 边缘: /dns-query/accel/international     (clientIDs = [accel, international])
+边缘   → 中枢: https://hub:4215/dns-query/accel/international
+```
+
+- **顺序无关**：缓存 key 按 client_id 排序后生成，`/a/b` 与 `/b/a` 复用同一组 upstream
+- **变体 upstream 懒构建**：每个不同的 client_id 集合构建一组变体（保持
+  load_balance/parallel/fastest_addr 各模式结构），LRU 缓存，超过
+  `passthrough_cache_size` 逐出并关闭被逐出的连接池；实际组合通常为个位数
+- **无 client_id 的查询**直接使用原始 upstream，不产生变体
+- 典型部署见 [`scenarios/hub-edge.md`](../scenarios/hub-edge.md)
 
 ## 支持的协议
 

@@ -32,6 +32,7 @@ import (
 	"github.com/AdguardTeam/dnsproxy/fastip"
 	dnsproxy_upstream "github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/pmkol/mosdns-x/coremain"
+	"github.com/pmkol/mosdns-x/pkg/concurrent_lru"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
 	"go.uber.org/zap"
@@ -67,6 +68,12 @@ type Args struct {
 
 	// 全局超时（秒），默认 5。
 	Timeout int `yaml:"timeout"`
+
+	// 出站 URL 透传客户端 client_id：把 ReqMeta 中的 clientIDs 以 path 段
+	// 形式追加到每个 upstream addr 的路径后（/dns-query + "/" + ids...）。
+	ClientIDPassthrough bool `yaml:"client_id_passthrough"`
+	// 每个"不同 client_id 集合"懒构建一组变体 upstream，用 LRU 缓存。
+	PassthroughCacheSize int `yaml:"passthrough_cache_size"` // 默认 16
 }
 
 type UpstreamConfig struct {
@@ -107,6 +114,14 @@ type adgForward struct {
 	rawUpstreams    []dnsproxy_upstream.Upstream
 	upstreamsCloser []dnsproxy_upstream.Upstream
 
+	// 构建 upstream 所用的共享参数（供 base 与 client_id 变体复用）。
+	timeout   time.Duration
+	bootstrap dnsproxy_upstream.Resolver
+
+	// client_id 出站透传：按 client_id 集合懒构建变体 upstream。
+	passthroughCache *concurrent_lru.ConcurrentLRU[string, []dnsproxy_upstream.Upstream]
+	passthroughMu    sync.Mutex
+
 	// fastest_addr 模式
 	fastestAddr *fastip.FastestAddr
 
@@ -139,9 +154,10 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 	}
 
 	f := &adgForward{
-		BP:   bp,
-		args: args,
-		mode: args.Mode,
+		BP:      bp,
+		args:    args,
+		mode:    args.Mode,
+		timeout: timeout,
 	}
 
 	if args.Mode == ModeFastestAddr {
@@ -152,8 +168,21 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 		f.rttStatsMap = make(map[string]*rttStats)
 	}
 
+	// client_id 出站透传的变体缓存；逐出时关闭对应 upstream 释放连接池。
+	if args.ClientIDPassthrough {
+		cacheSize := args.PassthroughCacheSize
+		if cacheSize <= 0 {
+			cacheSize = defaultPassthroughCacheSize
+		}
+		f.passthroughCache = concurrent_lru.NewConecurrentLRU[string, []dnsproxy_upstream.Upstream](
+			cacheSize,
+			func(_ string, ups []dnsproxy_upstream.Upstream) {
+				closeUpstreamGroup(ups)
+			},
+		)
+	}
+
 	// ── Build global bootstrap pool ──────────────────────────────────────
-	var globalBootstrap dnsproxy_upstream.Resolver
 	if len(args.Bootstrap) > 0 {
 		bsOpts := &dnsproxy_upstream.Options{
 			Timeout: timeout,
@@ -164,7 +193,7 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to create bootstrap resolver %s: %w", args.Bootstrap[0], err)
 			}
-			globalBootstrap = dnsproxy_upstream.NewCachingResolver(r)
+			f.bootstrap = dnsproxy_upstream.NewCachingResolver(r)
 		} else {
 			var resolvers []dnsproxy_upstream.Resolver
 			for _, bs := range args.Bootstrap {
@@ -175,45 +204,69 @@ func newAdgForward(bp *coremain.BP, args *Args) (*adgForward, error) {
 				resolvers = append(resolvers, r)
 			}
 			pr := dnsproxy_upstream.ParallelResolver(resolvers)
-			globalBootstrap = &pr
+			f.bootstrap = &pr
 		}
 	}
 
 	// ── Build each upstream ──────────────────────────────────────────────
-	for i, c := range args.Upstream {
+	addrs := make([]string, 0, len(args.Upstream))
+	for _, c := range args.Upstream {
 		if len(c.Addr) == 0 {
 			return nil, errors.New("missing upstream addr")
 		}
+		addrs = append(addrs, c.Addr)
+	}
 
+	ups, err := f.buildUpstreamGroup(addrs)
+	if err != nil {
+		return nil, err
+	}
+	f.rawUpstreams = ups
+	f.upstreamsCloser = append(f.upstreamsCloser, ups...)
+
+	bp.L().Info("adg_forward initialized",
+		zap.Int("upstreams", len(args.Upstream)),
+		zap.String("mode", string(args.Mode)),
+		zap.Int("bootstrap", len(args.Bootstrap)),
+		zap.Bool("client_id_passthrough", args.ClientIDPassthrough),
+	)
+
+	return f, nil
+}
+
+// buildUpstreamGroup 用与 base upstream 完全相同的参数，为一组 addr 构建一组
+// dnsproxy upstream。addrs 与 f.args.Upstream 按顺序一一对应，从而保持每个
+// 上游各自的 HTTP3/InsecureSkipVerify 配置不变。
+func (f *adgForward) buildUpstreamGroup(addrs []string) ([]dnsproxy_upstream.Upstream, error) {
+	if len(addrs) != len(f.args.Upstream) {
+		return nil, fmt.Errorf("internal: upstream addr count mismatch: %d != %d", len(addrs), len(f.args.Upstream))
+	}
+
+	ups := make([]dnsproxy_upstream.Upstream, 0, len(addrs))
+	for i, addr := range addrs {
+		c := f.args.Upstream[i]
 		opts := &dnsproxy_upstream.Options{
-			Timeout:            timeout,
+			Timeout:            f.timeout,
 			InsecureSkipVerify: c.InsecureSkipVerify,
-			Bootstrap:          globalBootstrap,
+			Bootstrap:          f.bootstrap,
 		}
-
 		if c.HTTP3 {
 			opts.HTTPVersions = []dnsproxy_upstream.HTTPVersion{
 				dnsproxy_upstream.HTTPVersion3,
 			}
 		}
 
-		u, err := dnsproxy_upstream.AddressToUpstream(c.Addr, opts)
+		u, err := dnsproxy_upstream.AddressToUpstream(addr, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to init upstream %s: %w", c.Addr, err)
+			// 回滚已创建的上游，避免连接池泄漏。
+			for _, built := range ups {
+				built.Close()
+			}
+			return nil, fmt.Errorf("failed to init upstream %s: %w", addr, err)
 		}
-
-		_ = i // 当前模式下不需要 upstreamWrapper，直接用 rawUpstreams
-		f.rawUpstreams = append(f.rawUpstreams, u)
-		f.upstreamsCloser = append(f.upstreamsCloser, u)
+		ups = append(ups, u)
 	}
-
-	bp.L().Info("adg_forward initialized",
-		zap.Int("upstreams", len(args.Upstream)),
-		zap.String("mode", string(args.Mode)),
-		zap.Int("bootstrap", len(args.Bootstrap)),
-	)
-
-	return f, nil
+	return ups, nil
 }
 
 // Exec 根据 mode 选择查询策略。
@@ -230,13 +283,24 @@ func (f *adgForward) Exec(ctx context.Context, qCtx *query_context.Context, next
 	var r *dns.Msg
 	var err error
 
+	upstreams := f.rawUpstreams
+	if f.passthroughCache != nil {
+		ids := qCtx.ReqMeta().GetClientIDs()
+		if len(ids) > 0 {
+			upstreams, err = f.upstreamsForIDs(ids)
+			if err != nil {
+				return fmt.Errorf("adg_forward: build client_id variant: %w", err)
+			}
+		}
+	}
+
 	switch f.mode {
 	case ModeParallel:
-		r, err = f.execParallel(q)
+		r, err = f.execParallel(q, upstreams)
 	case ModeFastestAddr:
-		r, err = f.execFastestAddr(q)
+		r, err = f.execFastestAddr(q, upstreams)
 	default: // ModeLoadBalance
-		r, err = f.execLoadBalance(q)
+		r, err = f.execLoadBalance(q, upstreams)
 	}
 
 	if err != nil {
@@ -248,8 +312,8 @@ func (f *adgForward) Exec(ctx context.Context, qCtx *query_context.Context, next
 }
 
 // execParallel 并发查询所有 upstream，返回第一个成功响应。
-func (f *adgForward) execParallel(q *dns.Msg) (*dns.Msg, error) {
-	r, resolved, err := dnsproxy_upstream.ExchangeParallel(f.rawUpstreams, q.Copy())
+func (f *adgForward) execParallel(q *dns.Msg, upstreams []dnsproxy_upstream.Upstream) (*dns.Msg, error) {
+	r, resolved, err := dnsproxy_upstream.ExchangeParallel(upstreams, q.Copy())
 	if err != nil {
 		return nil, err
 	}
@@ -264,8 +328,8 @@ func (f *adgForward) execParallel(q *dns.Msg) (*dns.Msg, error) {
 }
 
 // execFastestAddr 查询所有 upstream，对返回的 IP 地址 ping 测速，返回最快 IP 的响应。
-func (f *adgForward) execFastestAddr(q *dns.Msg) (*dns.Msg, error) {
-	r, resolved, err := f.fastestAddr.ExchangeFastest(q, f.rawUpstreams)
+func (f *adgForward) execFastestAddr(q *dns.Msg, upstreams []dnsproxy_upstream.Upstream) (*dns.Msg, error) {
+	r, resolved, err := f.fastestAddr.ExchangeFastest(q, upstreams)
 	if err != nil {
 		return nil, err
 	}
@@ -280,11 +344,11 @@ func (f *adgForward) execFastestAddr(q *dns.Msg) (*dns.Msg, error) {
 }
 
 // execLoadBalance 基于 RTT 加权随机选择一个 upstream 查询。
-func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
-	if len(f.rawUpstreams) == 1 {
-		addr := f.rawUpstreams[0].Address()
+func (f *adgForward) execLoadBalance(q *dns.Msg, upstreams []dnsproxy_upstream.Upstream) (*dns.Msg, error) {
+	if len(upstreams) == 1 {
+		addr := upstreams[0].Address()
 		start := time.Now()
-		r, err := f.rawUpstreams[0].Exchange(q)
+		r, err := upstreams[0].Exchange(q)
 		elapsed := time.Since(start)
 		if err != nil {
 			f.L().Warn("adg_forward: upstream error",
@@ -302,10 +366,10 @@ func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
 	}
 
 	// 加权随机选择
-	weights := make([]float64, len(f.rawUpstreams))
+	weights := make([]float64, len(upstreams))
 	f.rttLock.Lock()
-	for i := range f.rawUpstreams {
-		addr := f.rawUpstreams[i].Address()
+	for i := range upstreams {
+		addr := upstreams[i].Address()
 		stats := f.rttStatsMap[addr]
 		if stats == nil {
 			weights[i] = 1
@@ -317,11 +381,11 @@ func (f *adgForward) execLoadBalance(q *dns.Msg) (*dns.Msg, error) {
 
 	idx := weightedSelect(weights)
 	start := time.Now()
-	r, err := f.rawUpstreams[idx].Exchange(q)
+	r, err := upstreams[idx].Exchange(q)
 
 	// 更新 RTT 统计
 	elapsed := time.Since(start)
-	addr := f.rawUpstreams[idx].Address()
+	addr := upstreams[idx].Address()
 
 	f.rttLock.Lock()
 	stats, ok := f.rttStatsMap[addr]
@@ -368,6 +432,12 @@ func weightedSelect(weights []float64) int {
 func (f *adgForward) Shutdown() error {
 	for _, u := range f.upstreamsCloser {
 		u.Close()
+	}
+	// 关闭所有 client_id 变体 upstream（Clean 逐出时经 onEvict 触发 Close）。
+	if f.passthroughCache != nil {
+		f.passthroughCache.Clean(func(_ string, _ []dnsproxy_upstream.Upstream) bool {
+			return true
+		})
 	}
 	return nil
 }

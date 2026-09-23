@@ -13,6 +13,7 @@ client_id 区分（机制见 [`docs/doh-path.md`](../doh-path.md)）：
 | 内网/国内设备 | `/dns-query` | 无 tag | pdns 内网加速（K3S 服务） | [internal-accelerate](./internal-accelerate.md) |
 | 隧道加速客户端 | `/dns-query/accel` | `accel` | 国内隧道（拨测 gate + hosts 应答） | [tunnel-accelerate](./tunnel-accelerate.md) |
 | 海外/有梯子设备 | `/dns-query/outdoor` | `outdoor` | 直接公网（Cloudflare，ECH 完整） | [outdoor](./outdoor.md) |
+| 多节点部署 | — | 中枢/边缘分层 | 等级跨节点传播与数据源收敛 | [hub-edge](./hub-edge.md) |
 
 服务器组件：
 

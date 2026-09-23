@@ -27,10 +27,17 @@
 中枢:   tunnel_accelerate / pdns / outdoor / 兜底 各分支独立匹配
 ```
 
-选型记录：未采用 EDNS0 私有 option 携带等级——那需要在两端各加编解码 +
-出口剥离防外泄，且日志不可读；path 通道只有边缘一端改动（一个开关）、中枢
-零改动、访问日志直接可读。节点间链路是 DoH/DoQ，path 天然可用；若未来出现
-UDP 中继再考虑 EDNS0 方案。
+选型记录：节点间身份通道最终为**双通道并存**——
+
+- **path 通道**：`adg_forward` 的 `client_id_passthrough`，动态拼接出站 URL，
+  DoH/DoQ 链路可用，日志直观
+- **EDNS 通道**：`edns_client_id` 插件（私有 option 65002，TLV 列表格式），
+  随报文走任意传输（UDP/TCP/DoT 皆可），写入/读取/剥离三模式见
+  [`edns_client_id`](../plugins/edns_client_id.md)
+
+两通道携带同一 tag 集合时中枢并集去重，幂等无冲突；双载提供传输无关的冗余。
+曾经只走单通道的取舍：EDNS 需要两端编解码+出口剥离（读端 read 模式已内建），
+path 则一端开关即可——因此 DoH 链路以 path 为主，EDNS 兜住未来 UDP/DoT 中继。
 
 ## 流程
 

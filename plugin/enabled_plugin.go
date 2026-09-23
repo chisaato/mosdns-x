@@ -34,6 +34,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ech_block"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ecs"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/edns0_filter"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/edns_client_id"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/fast_forward"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/hosts"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ipset"

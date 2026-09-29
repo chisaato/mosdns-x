@@ -37,10 +37,12 @@ import (
 
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/pmkol/mosdns-x/coremain"
 	"github.com/pmkol/mosdns-x/pkg/concurrent_lru"
 	"github.com/pmkol/mosdns-x/pkg/data_provider"
+	"github.com/pmkol/mosdns-x/pkg/dnsutils"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
 	"github.com/pmkol/mosdns-x/pkg/hosts"
 	"github.com/pmkol/mosdns-x/pkg/matcher/domain"
@@ -105,6 +107,7 @@ type tunnelAccelerate struct {
 
 	dialProbe dialProbeFunc
 	cache     *concurrent_lru.ConcurrentLRU[string, *probeCacheEntry]
+	probeSF   singleflight.Group
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
@@ -196,6 +199,16 @@ func (t *tunnelAccelerate) Exec(ctx context.Context, qCtx *query_context.Context
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
+	if !needsProbe(q) {
+		// other qtypes fall through
+		return t.fallThrough(ctx, qCtx, next)
+	}
+
+	// Probe every endpoint of the domain in one concurrent batch, so a query
+	// costs at most one probe_timeout even when its family is dead and the
+	// other family has to be consulted.
+	alive4, alive6 := t.probeEntry(ctx, fqdn, ipv4, ipv6)
+
 	// Decide per question; take over the query if any question says so.
 	var answers []dns.RR
 	takeOver := false
@@ -204,32 +217,57 @@ func (t *tunnelAccelerate) Exec(ctx context.Context, qCtx *query_context.Context
 		case dns.TypeHTTPS:
 			// Any endpoint alive: suppress ECH key distribution
 			// with an empty NOERROR.
-			if t.probeAnyAlive(ctx, fqdn, ipv4, ipv6) {
+			if len(alive4)+len(alive6) > 0 {
 				takeOver = true
 			}
 		case dns.TypeA:
-			rrs, takeover := t.decideAddrFamily(ctx, fqdn, ipv4, ipv6, false)
+			rrs, takeover := t.decideAddrFamily(fqdn, alive4, alive6, false)
 			if takeover {
 				takeOver = true
 				answers = append(answers, rrs...)
 			}
 		case dns.TypeAAAA:
-			rrs, takeover := t.decideAddrFamily(ctx, fqdn, ipv6, ipv4, true)
+			rrs, takeover := t.decideAddrFamily(fqdn, alive6, alive4, true)
 			if takeover {
 				takeOver = true
 				answers = append(answers, rrs...)
 			}
-		default:
-			// other qtypes fall through
 		}
 	}
 
 	if !takeOver {
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+		return t.fallThrough(ctx, qCtx, next)
 	}
 
 	t.setReply(qCtx, answers)
 	return nil
+}
+
+// needsProbe reports whether q has a question whose answer depends on the
+// probe result.
+func needsProbe(q *dns.Msg) bool {
+	for i := range q.Question {
+		switch q.Question[i].Qtype {
+		case dns.TypeA, dns.TypeAAAA, dns.TypeHTTPS:
+			return true
+		}
+	}
+	return false
+}
+
+// fallThrough hands a registered domain over to the next node (public
+// resolution) and caps the ttl of the response at Args.TTL.
+//
+// The fallback answer is only valid until the next probe decision, so it
+// must not outlive it. Otherwise, after the tunnel recovers, a public HTTPS
+// record (carrying ECH) could stay cached next to a fresh tunnel A record,
+// and the client would handshake with ECH against the tunnel endpoint.
+func (t *tunnelAccelerate) fallThrough(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+	err := executable_seq.ExecChainNode(ctx, qCtx, next)
+	if r := qCtx.R(); r != nil {
+		dnsutils.ApplyMaximumTTL(r, uint32(t.args.TTL))
+	}
+	return err
 }
 
 // lookup exact matches fqdn in the hosts matcher.
@@ -240,24 +278,19 @@ func (t *tunnelAccelerate) lookup(fqdn string) (*hosts.IPs, bool) {
 	return t.hostsMatcher.Match(fqdn)
 }
 
-// decideAddrFamily probes the primary family (the queried one). It returns
-// records for the alive primary IPs, or a suppress decision (empty NOERROR)
-// when the primary family is dead/unconfigured but the secondary family has
-// at least one alive IP. It returns no takeover when both families are dead,
-// so the query falls through to the next node.
-func (t *tunnelAccelerate) decideAddrFamily(ctx context.Context, fqdn string, primary, secondary []netip.Addr, isAAAA bool) (rrs []dns.RR, takeOver bool) {
-	port := t.probePortFor(fqdn)
-
-	if len(primary) > 0 {
-		alive := t.probeAliveIPs(ctx, primary, port)
-		if len(alive) > 0 {
-			return t.buildAddrRRs(fqdn, alive, isAAAA), true
-		}
+// decideAddrFamily decides the answer for the queried (primary) family. It
+// returns records for the alive primary IPs, or a suppress decision (empty
+// NOERROR) when the primary family is dead/unconfigured but the secondary
+// family has at least one alive IP. It returns no takeover when both families
+// are dead, so the query falls through to the next node.
+func (t *tunnelAccelerate) decideAddrFamily(fqdn string, alivePrimary, aliveSecondary []netip.Addr, isAAAA bool) (rrs []dns.RR, takeOver bool) {
+	if len(alivePrimary) > 0 {
+		return t.buildAddrRRs(fqdn, alivePrimary, isAAAA), true
 	}
 
 	// Primary family unconfigured or all dead: suppress this family
 	// if the other family is still alive.
-	if len(secondary) > 0 && len(t.probeAliveIPs(ctx, secondary, port)) > 0 {
+	if len(aliveSecondary) > 0 {
 		return nil, true
 	}
 
@@ -265,24 +298,17 @@ func (t *tunnelAccelerate) decideAddrFamily(ctx context.Context, fqdn string, pr
 	return nil, false
 }
 
-// probeAnyAlive reports whether any of the ips is alive.
-func (t *tunnelAccelerate) probeAnyAlive(ctx context.Context, fqdn string, ipv4, ipv6 []netip.Addr) bool {
+// probeEntry probes all ipv4 and ipv6 endpoints of fqdn concurrently and
+// returns the alive ones of each family, in their original order.
+func (t *tunnelAccelerate) probeEntry(ctx context.Context, fqdn string, ipv4, ipv6 []netip.Addr) (alive4, alive6 []netip.Addr) {
 	all := make([]netip.Addr, 0, len(ipv4)+len(ipv6))
 	all = append(all, ipv4...)
 	all = append(all, ipv6...)
-	return len(t.probeAliveIPs(ctx, all, t.probePortFor(fqdn))) > 0
-}
+	port := t.probePortFor(fqdn)
 
-// probeAliveIPs probes all ips concurrently and returns the alive ones
-// in their original order.
-func (t *tunnelAccelerate) probeAliveIPs(ctx context.Context, ips []netip.Addr, port int) []netip.Addr {
-	if len(ips) == 0 {
-		return nil
-	}
-
-	results := make([]bool, len(ips))
+	results := make([]bool, len(all))
 	var wg sync.WaitGroup
-	for i, ip := range ips {
+	for i, ip := range all {
 		wg.Add(1)
 		go func(i int, ip netip.Addr) {
 			defer wg.Done()
@@ -291,31 +317,48 @@ func (t *tunnelAccelerate) probeAliveIPs(ctx context.Context, ips []netip.Addr, 
 	}
 	wg.Wait()
 
-	var alive []netip.Addr
 	for i, ok := range results {
-		if ok {
-			alive = append(alive, ips[i])
+		if !ok {
+			continue
+		}
+		if i < len(ipv4) {
+			alive4 = append(alive4, all[i])
+		} else {
+			alive6 = append(alive6, all[i])
 		}
 	}
-	return alive
+	return alive4, alive6
 }
 
 // probeIP probes a single ip:port endpoint, with an LRU+TTL cache
 // in front of the actual dial.
+//
+// Concurrent misses on the same endpoint share one dial. The dial is detached
+// from the query ctx: a canceled or nearly expired query must not be cached
+// as a "dead" verdict. If ctx is done first, this query alone treats the
+// endpoint as dead, and the detached dial still caches its real result.
 func (t *tunnelAccelerate) probeIP(ctx context.Context, ip netip.Addr, port int) bool {
 	key := net.JoinHostPort(ip.String(), strconv.Itoa(port))
-	now := time.Now()
 
-	if entry, ok := t.cache.Get(key); ok && now.Before(entry.expireAt) {
+	if entry, ok := t.cache.Get(key); ok && time.Now().Before(entry.expireAt) {
 		return entry.alive
 	}
 
-	alive := t.dialProbe(ctx, ip.String(), port, t.probeTimeout)
-	t.cache.Add(key, &probeCacheEntry{
-		alive:    alive,
-		expireAt: now.Add(t.cacheTTL),
+	ch := t.probeSF.DoChan(key, func() (interface{}, error) {
+		alive := t.dialProbe(context.Background(), ip.String(), port, t.probeTimeout)
+		t.cache.Add(key, &probeCacheEntry{
+			alive:    alive,
+			expireAt: time.Now().Add(t.cacheTTL),
+		})
+		return alive, nil
 	})
-	return alive
+
+	select {
+	case res := <-ch:
+		return res.Val.(bool)
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // probePortFor returns the probe port for the exact fqdn.

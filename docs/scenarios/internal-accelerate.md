@@ -31,6 +31,9 @@ K3S external-dns 将服务记录写入 pdns（RFC2136 DNS Update），**pdns 记
   「不在 gate → 放行」两种语义。
 - K3S 场景没有"拨测"概念——记录存在即活。单栈集群只推一族时，另一族永远空应答
   （客户端只用存活族），这是防「内网 v4 + 公网 v6」混族泄漏的关键。
+- ech_block 放行时（未命中 pdns / 探测失败）把公网 TYPE65 应答 TTL 压到
+  `max_pass_ttl`（默认 = `cache_ttl`）：服务刚部署进 K3S 时，客户端缓存里的
+  Cloudflare ECH 配置最多残留一个 `cache_ttl`，不会拿着它去连新出现的内网 IP。
 - ech_block 使用**双族探测**（A+AAAA 任一存在即阻断）：v6-only 集群只登记 AAAA
   时旧版只探 A 会漏判，导致客户端拿到 Cloudflare 的 ECH 公钥去连内网 IP 而握手失败。
 - pdns 库中存在仅有 `a-`/`aaaa-` TXT 而无地址记录的孤儿条目（如 minio 相关记录），

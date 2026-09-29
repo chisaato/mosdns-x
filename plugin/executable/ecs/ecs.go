@@ -147,6 +147,9 @@ func (e *ecsPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next 
 func (e *ecsPlugin) addECS(qCtx *query_context.Context) (upgraded bool, newECS bool) {
 	q := qCtx.Q()
 	opt := q.IsEdns0()
+	if opt != nil {
+		dropNonPublicECS(opt)
+	}
 	hasECS := opt != nil && dnsutils.GetECS(opt) != nil
 	if hasECS && !e.args.ForceOverwrite {
 		// Argument args.ForceOverwrite is disabled. q already has an edns0 subnet. Skip it.
@@ -156,7 +159,9 @@ func (e *ecsPlugin) addECS(qCtx *query_context.Context) (upgraded bool, newECS b
 	var ecs *dns.EDNS0_SUBNET
 	if e.args.Auto { // use client ip
 		clientAddr := qCtx.ReqMeta().GetClientAddr()
-		if !clientAddr.IsValid() {
+		// A non-public client (e.g. a local test on the server itself) gets
+		// no ECS, so the upstream answers by the server's own address.
+		if !clientAddr.IsValid() || !isPublicAddr(clientAddr) {
 			return false, false
 		}
 

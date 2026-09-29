@@ -58,6 +58,8 @@ app.example.com 5.6.7.8 2408:aaaa::1
 - 拨测粒度为**主机名级**：同 zone 下不同服务独立探测互不影响；
   同名多 IP 也是逐 IP 探测、只回存活 IP。
 - 故障切换/恢复收敛 ≈ `probe_cache_ttl` + `ttl` + 客户端缓存 ≈ 2 分钟量级。
+  回落公网的应答 TTL 同样被压到 `ttl`，避免公网 HTTPS（含 ECH）在隧道恢复后
+  残留。adg_cache 不会把这类短 TTL 应答当 stale 继续返回（见下方说明）。
 
 ## sequence 挂载
 
@@ -70,11 +72,26 @@ exec:
     exec:
       - tunnel_accelerate           # 命中并接管 → 结束；全死 → 穿透
   - if: match_client_outdoor
-    exec: [split_forward]
+    exec: [split_forward, _return]  # 终结分支
   # ... 无 tag 现有链路
 ```
 
 accel 客户端查询未登记域名 → 不命中 hosts → 穿透走后续公网分流，零额外配置。
+
+> **`_return` 的作用域**：mosdns 的 `if` 分支执行完会继续走外层后续节点；
+> `_return` 写在 `split_forward` 这类子 sequence 内部也只退出子 sequence，外层
+> 仍会继续。因此需要终结的分支（如 outdoor）要在**顶层分支里**写 `_return`，
+> 否则 outdoor 应答会被后续 ech_block / forward_pdns 覆盖。
+>
+> accel 穿透则是有意继续：回落会依次经过 adg_filter / adg_cache 和无 tag 链路。
+> 注意这包括 pdns 内网加速分支——同时登记在隧道与 pdns 的域名，隧道全挂时 accel
+> 客户端会拿到内网 IP。若 accel 客户端不在内网，给该分支加条件排除 accel：
+> `if: "match_internal_accelerate && !match_client_accel"`。
+
+> **与 adg_cache 乐观缓存的配合**：adg_cache 对缓存 TTL ≤ `stale_min_ttl`
+> （默认 = `optimistic_ttl` = 30）的条目不做过期响应，加速应答与回落应答（TTL
+> 均压到 `ttl`）过期即重新判定；其余条目 stale 命中时总是后台刷新。两个 30
+> 需要保持 `ttl` ≤ `stale_min_ttl`，调大 `ttl` 时同步调大 `stale_min_ttl`。
 
 ## 客户端接入 **[待补充]**
 

@@ -85,6 +85,23 @@ plugins:
       exec: [_return]             # 超时/不可达 → 穿透本地 split 降级
 ```
 
+本地降级的应答不带中枢的 TTL 压制：若中枢只是某一条查询超时（如 TYPE65），
+边缘会把公网 HTTPS（含 ECH，常见 TTL 300）和中枢给出的隧道/内网 A 记录同时
+交给客户端。给路由域的本地降级结果也压 TTL，把这个毛刺限制在短窗口内：
+
+```yaml
+plugins:
+  - tag: cap_accel_ttl
+    type: ttl
+    args:
+      maximum_ttl: 30             # 与中枢 tunnel_accelerate 的 ttl 一致
+
+# default_sequence（本地 split_forward 之后）
+- split_forward
+- if: match_accel_route
+  exec: [cap_accel_ttl]
+```
+
 边缘**不需要**：`tunnel_accelerate`、`ech_block`、`forward_pdns`、
 `_response_noerror` 之外的中枢插件——加速逻辑全部集中在中枢。
 

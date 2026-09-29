@@ -22,7 +22,7 @@ match_client_outdoor → split_forward
 exec:
   # tunnel_accelerate 分支在前（仅 accel 客户端命中）
   - if: match_client_outdoor
-    exec: [split_forward]
+    exec: [split_forward, _return]  # _return 必须在顶层分支内，否则会串入无 tag 链路
   # ... 无 tag 链路
 ```
 

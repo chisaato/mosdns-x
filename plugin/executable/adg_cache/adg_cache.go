@@ -48,7 +48,13 @@ type Args struct {
 	// Optimistic controls whether expired cache is served when still within
 	// StaleTTL.  Default true (serve expired but with OptimisticTTL-adjusted
 	// TTL so the client doesn't cache our stale value too long).
-	Optimistic bool `yaml:"optimistic"`
+	// A pointer so that an explicit false can be told apart from unset.
+	Optimistic *bool `yaml:"optimistic"`
+	// StaleMinTTL: only entries whose stored ttl is greater than this are
+	// served stale. A short ttl is a short-lived decision (e.g. a probe
+	// gate), and serving it stale would extend it past its own validity.
+	// 0 means OptimisticTTL, < 0 serves every entry stale.
+	StaleMinTTL int `yaml:"stale_min_ttl"`
 }
 
 type adgCachePlugin struct {
@@ -56,6 +62,7 @@ type adgCachePlugin struct {
 	args *Args
 
 	items          glcache.Cache
+	metrics        *cacheMetrics
 	prefetchSF     singleflight.Group
 	prefetchCtx    context.Context
 	prefetchCancel context.CancelFunc
@@ -79,21 +86,31 @@ func newAdgCachePlugin(bp *coremain.BP, args *Args) (*adgCachePlugin, error) {
 		args.OptimisticTTL = defaultOptimisticTTL
 	}
 	// Default to optimistic (serve stale).
-	if !args.Optimistic && args.StaleTTL > 0 {
-		args.Optimistic = true
+	if args.Optimistic == nil {
+		optimistic := true
+		args.Optimistic = &optimistic
+	}
+	if args.StaleMinTTL == 0 {
+		args.StaleMinTTL = args.OptimisticTTL
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &adgCachePlugin{
-		BP:   bp,
-		args: args,
-		items: glcache.New(glcache.Config{
-			MaxSize:   uint(args.Size),
-			EnableLRU: true,
-		}),
+		BP:             bp,
+		args:           args,
+		metrics:        newCacheMetrics(),
 		prefetchCtx:    ctx,
 		prefetchCancel: cancel,
+	}
+	p.items = glcache.New(glcache.Config{
+		MaxSize:   uint(args.Size),
+		EnableLRU: true,
+		OnDelete:  p.onEvict,
+	})
+	if err := p.registerMetrics(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("adg_cache: register metrics: %w", err)
 	}
 	return p, nil
 }
@@ -111,6 +128,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
+	f.metrics.queryTotal.Inc()
 	cached := f.items.Get([]byte(key))
 	if cached != nil {
 		msg, expiry, err := unpackCacheValue(cached)
@@ -120,42 +138,50 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		}
 
 		now := uint32(time.Now().Unix())
+		// The stored msg keeps the ttl it had when it was cached.
+		origTTL := dnsutils.GetMinimalTTL(msg)
 
 		// Fresh entry (not expired): serve directly.
 		if now < expiry {
-			elapsed := expiry - now
-			origTTL := dnsutils.GetMinimalTTL(msg)
-			if elapsed < origTTL {
-				dnsutils.SubtractTTL(msg, origTTL-elapsed)
+			remaining := expiry - now
+			if remaining < origTTL {
+				dnsutils.SubtractTTL(msg, origTTL-remaining)
 			}
 			msg.Id = q.Id
 			qCtx.SetResponse(msg)
+			f.metrics.hitTotal.Inc()
 			f.L().Debug("adg_cache: fresh hit", qCtx.InfoField())
+
+			// Prefetch: refresh a hit entry shortly before it expires, so
+			// hot entries never go stale. Entries whose whole ttl fits in
+			// the window are skipped, or every hit would refresh them.
+			if f.args.Prefetch && remaining <= uint32(f.args.PrefetchTTL) && origTTL > uint32(f.args.PrefetchTTL) {
+				f.doRefresh(key, qCtx, next)
+			}
 			return nil
 		}
 
 		// Expired entry.
 		expiredSec := now - expiry
 
-		// If optimistic is on and still within StaleTTL, serve stale.
-		if f.args.Optimistic && expiredSec <= uint32(f.args.StaleTTL) {
+		if f.canServeStale(origTTL, expiredSec) {
 			dnsutils.SetTTL(msg, uint32(f.args.OptimisticTTL))
 			msg.Id = q.Id
 			qCtx.SetResponse(msg)
+			f.metrics.staleHitTotal.Inc()
 			f.L().Debug("adg_cache: stale hit",
 				qCtx.InfoField(),
 				zap.Uint32("expired_sec", expiredSec),
 			)
 
-			// Trigger prefetch if enabled and within prefetch window.
-			if f.args.Prefetch && expiredSec <= uint32(f.args.PrefetchTTL) {
-				f.doPrefetch(key, qCtx, next)
-			}
+			// Always refresh in the background, so a stale entry is served
+			// only until the refresh lands, not for the whole StaleTTL.
+			f.doRefresh(key, qCtx, next)
 			return nil
 		}
 
-		// Not optimistic or beyond StaleTTL: treat as miss.
-		f.L().Debug("adg_cache: miss (expired beyond stale)", qCtx.InfoField())
+		// Not servable stale: treat as miss.
+		f.L().Debug("adg_cache: miss (expired, not served stale)", qCtx.InfoField())
 	}
 
 	// Cache miss: run next chain node, store result if valid.
@@ -169,7 +195,18 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 	return err
 }
 
-func (f *adgCachePlugin) doPrefetch(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
+// canServeStale reports whether an entry cached with origTTL and expired
+// expiredSec seconds ago may be served stale.
+func (f *adgCachePlugin) canServeStale(origTTL, expiredSec uint32) bool {
+	if !*f.args.Optimistic || expiredSec > uint32(f.args.StaleTTL) {
+		return false
+	}
+	return f.args.StaleMinTTL < 0 || origTTL > uint32(f.args.StaleMinTTL)
+}
+
+// doRefresh re-runs the next chain in the background and stores the result.
+// Concurrent refreshes of the same key are merged.
+func (f *adgCachePlugin) doRefresh(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	select {
 	case <-f.prefetchCtx.Done():
 		return
@@ -178,23 +215,23 @@ func (f *adgCachePlugin) doPrefetch(key string, qCtx *query_context.Context, nex
 
 	go func() {
 		_, _, _ = f.prefetchSF.Do(key, func() (interface{}, error) {
-			defer f.prefetchSF.Forget(key)
-
 			pCtx, cancel := context.WithTimeout(f.prefetchCtx, defaultPrefetchTimeout)
 			defer cancel()
+			f.metrics.refreshTotal.Inc()
 
 			lazyQCtx := qCtx.Copy()
 			lazyQCtx.SetResponse(nil)
 			err := executable_seq.ExecChainNode(pCtx, lazyQCtx, next)
 			if err != nil {
-				f.L().Debug("adg_cache: prefetch failed", qCtx.InfoField(), zap.Error(err))
+				f.metrics.refreshFailedTotal.Inc()
+				f.L().Debug("adg_cache: refresh failed", qCtx.InfoField(), zap.Error(err))
 				return nil, nil
 			}
 
 			r := lazyQCtx.R()
 			if r != nil {
 				if storeErr := f.tryStore(key, r); storeErr != nil {
-					f.L().Debug("adg_cache: prefetch store failed", qCtx.InfoField(), zap.Error(storeErr))
+					f.L().Debug("adg_cache: refresh store failed", qCtx.InfoField(), zap.Error(storeErr))
 				}
 			}
 			return nil, nil

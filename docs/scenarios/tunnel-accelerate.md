@@ -59,7 +59,7 @@ app.example.com 5.6.7.8 2408:aaaa::1
   同名多 IP 也是逐 IP 探测、只回存活 IP。
 - 故障切换/恢复收敛 ≈ `probe_cache_ttl` + `ttl` + 客户端缓存 ≈ 2 分钟量级。
   回落公网的应答 TTL 同样被压到 `ttl`，避免公网 HTTPS（含 ECH）在隧道恢复后
-  残留。前提是下游缓存不把过期应答继续当 stale 返回（见下方 adg_cache 说明）。
+  残留。adg_cache 不会把这类短 TTL 应答当 stale 继续返回（见下方说明）。
 
 ## sequence 挂载
 
@@ -88,10 +88,10 @@ accel 客户端查询未登记域名 → 不命中 hosts → 穿透走后续公�
 > 客户端会拿到内网 IP。若 accel 客户端不在内网，给该分支加条件排除 accel：
 > `if: "match_internal_accelerate && !match_client_accel"`。
 
-> **adg_cache 的 stale 应答**：adg_cache 默认 optimistic，过期后仍以
-> `optimistic_ttl` 返回旧应答（最长 `stale_ttl`，默认 300s），且未开 prefetch 时
-> 不会刷新。放在加速分支下游时，这会把压过 TTL 的回落应答再延长数分钟。需要
-> 快速收敛的节点可配 `optimistic: false`。
+> **与 adg_cache 乐观缓存的配合**：adg_cache 对缓存 TTL ≤ `stale_min_ttl`
+> （默认 = `optimistic_ttl` = 30）的条目不做过期响应，加速应答与回落应答（TTL
+> 均压到 `ttl`）过期即重新判定；其余条目 stale 命中时总是后台刷新。两个 30
+> 需要保持 `ttl` ≤ `stale_min_ttl`，调大 `ttl` 时同步调大 `stale_min_ttl`。
 
 ## 客户端接入 **[待补充]**
 

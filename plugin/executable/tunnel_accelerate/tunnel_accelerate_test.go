@@ -23,6 +23,8 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,5 +272,115 @@ func Test_probeIP_cached(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("dial called %d times, want 1 (cached)", calls)
+	}
+}
+
+// responder is a chain tail that answers with a fixed-ttl record, standing in
+// for public resolution.
+type responder struct {
+	executable_seq.NodeLinker
+	ttl uint32
+}
+
+func (n *responder) Exec(_ context.Context, qCtx *query_context.Context, _ executable_seq.ExecutableChainNode) error {
+	q := qCtx.Q()
+	r := new(dns.Msg)
+	r.SetReply(q)
+	r.Answer = append(r.Answer, &dns.HTTPS{SVCB: dns.SVCB{
+		Hdr:      dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: n.ttl},
+		Priority: 1,
+		Target:   ".",
+	}})
+	qCtx.SetResponse(r)
+	return nil
+}
+
+// Test_fallThrough_capsTTL verifies that the public fallback answer of a
+// registered domain does not outlive the probe decision, while unregistered
+// domains are left untouched.
+func Test_fallThrough_capsTTL(t *testing.T) {
+	tests := []struct {
+		name       string
+		hostsEntry string
+		qtype      uint16
+		dead       []string
+		wantTTL    uint32
+	}{
+		{"registered, all dead, TYPE65", "example.com. 1.1.1.1", dns.TypeHTTPS, []string{"1.1.1.1"}, 30},
+		{"registered, qtype not probed", "example.com. 1.1.1.1", dns.TypeMX, nil, 30},
+		{"not registered", "other.com. 1.1.1.1", dns.TypeHTTPS, nil, 300},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newTestPlugin(t, tt.hostsEntry, tt.dead)
+			q := new(dns.Msg)
+			q.SetQuestion("example.com.", tt.qtype)
+			qCtx := query_context.NewContext(q, nil)
+			if err := p.Exec(context.Background(), qCtx, &responder{ttl: 300}); err != nil {
+				t.Fatalf("Exec() error: %v", err)
+			}
+			r := qCtx.R()
+			if r == nil || len(r.Answer) != 1 {
+				t.Fatalf("expected the fallback answer, got %v", r)
+			}
+			if got := r.Answer[0].Header().Ttl; got != tt.wantTTL {
+				t.Fatalf("ttl = %d, want %d", got, tt.wantTTL)
+			}
+		})
+	}
+}
+
+// Test_probeIP_canceledCtxNotCached verifies that a query whose ctx is already
+// done does not cache a "dead" verdict for a healthy endpoint.
+func Test_probeIP_canceledCtxNotCached(t *testing.T) {
+	p := newTestPlugin(t, "example.com. 1.1.1.1", nil)
+	p.dialProbe = func(ctx context.Context, _ string, _ int, _ time.Duration) bool {
+		return ctx.Err() == nil // a real dial fails on a done ctx
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	_ = p.Exec(canceled, query_context.NewContext(q, nil), &nextRecorder{})
+
+	q = new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	qCtx := query_context.NewContext(q, nil)
+	next := &nextRecorder{}
+	if err := p.Exec(context.Background(), qCtx, next); err != nil {
+		t.Fatalf("Exec() error: %v", err)
+	}
+	if next.called || qCtx.R() == nil || len(qCtx.R().Answer) != 1 {
+		t.Fatalf("healthy endpoint should be taken over after a canceled query, next called = %v", next.called)
+	}
+}
+
+// Test_probeIP_singleflight verifies that concurrent misses on the same
+// endpoint share one dial.
+func Test_probeIP_singleflight(t *testing.T) {
+	p := newTestPlugin(t, "example.com. 1.1.1.1", nil)
+	var calls atomic.Int32
+	release := make(chan struct{})
+	p.dialProbe = func(_ context.Context, _ string, _ int, _ time.Duration) bool {
+		calls.Add(1)
+		<-release
+		return true
+	}
+
+	ip := netip.MustParseAddr("1.1.1.1")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.probeIP(context.Background(), ip, 443)
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("dial called %d times, want 1", n)
 	}
 }

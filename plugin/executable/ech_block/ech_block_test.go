@@ -1,6 +1,7 @@
 package ech_block
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	dnsproxy_upstream "github.com/AdguardTeam/dnsproxy/upstream"
 
 	"github.com/pmkol/mosdns-x/coremain"
+	"github.com/pmkol/mosdns-x/pkg/executable_seq"
+	"github.com/pmkol/mosdns-x/pkg/query_context"
 )
 
 var _ dnsproxy_upstream.Upstream = (*fakeUpstream)(nil)
@@ -145,6 +148,79 @@ func TestProbeDualFamily(t *testing.T) {
 			}
 			if seen[dns.TypeA] != 1 || seen[dns.TypeAAAA] != 1 {
 				t.Fatalf("probe() sent queries %v, want one A and one AAAA", got)
+			}
+		})
+	}
+}
+
+// httpsResponder 模拟上游，返回固定 TTL 的 HTTPS 记录
+type httpsResponder struct {
+	executable_seq.NodeLinker
+	ttl uint32
+}
+
+func (n *httpsResponder) Exec(_ context.Context, qCtx *query_context.Context, _ executable_seq.ExecutableChainNode) error {
+	q := qCtx.Q()
+	r := new(dns.Msg)
+	r.SetReply(q)
+	r.Answer = append(r.Answer, &dns.HTTPS{SVCB: dns.SVCB{
+		Hdr:      dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: n.ttl},
+		Priority: 1,
+		Target:   ".",
+	}})
+	qCtx.SetResponse(r)
+	return nil
+}
+
+func TestExecDefaultsAndPassTTL(t *testing.T) {
+	qName := "example.com."
+
+	tests := []struct {
+		name       string
+		maxPassTTL int
+		up         *fakeUpstream
+		wantEmpty  bool   // 期望阻断为空 NOERROR
+		wantTTL    uint32 // 放行时期望的应答 TTL
+	}{
+		{name: "blocked, default empty NOERROR", up: &fakeUpstream{respByQtype: map[uint16][]dns.RR{dns.TypeA: {aRR(qName)}}}, wantEmpty: true},
+		{name: "not hijacked, ttl capped at cache_ttl", up: &fakeUpstream{}, wantTTL: 30},
+		{name: "probe failed, ttl capped at cache_ttl", up: &fakeUpstream{errByQtype: map[uint16]error{dns.TypeA: errors.New("timeout")}}, wantTTL: 30},
+		{name: "cap disabled", maxPassTTL: -1, up: &fakeUpstream{}, wantTTL: 300},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := newEchBlock(coremain.NewBP("test", PluginType, zap.NewNop(), nil), &Args{
+				ProbeDNS:   "127.0.0.1:53",
+				MaxPassTTL: tt.maxPassTTL,
+			})
+			if err != nil {
+				t.Fatalf("newEchBlock() error = %v", err)
+			}
+			b.probeUp = tt.up
+
+			q := new(dns.Msg)
+			q.SetQuestion(qName, dns.TypeHTTPS)
+			qCtx := query_context.NewContext(q, nil)
+			if err := b.Exec(context.Background(), qCtx, &httpsResponder{ttl: 300}); err != nil {
+				t.Fatalf("Exec() error = %v", err)
+			}
+
+			r := qCtx.R()
+			if r == nil {
+				t.Fatal("expected a response, got nil")
+			}
+			if tt.wantEmpty {
+				if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 {
+					t.Fatalf("want empty NOERROR, got rcode %d with %d answers", r.Rcode, len(r.Answer))
+				}
+				return
+			}
+			if len(r.Answer) != 1 {
+				t.Fatalf("want the upstream answer, got %d answers", len(r.Answer))
+			}
+			if got := r.Answer[0].Header().Ttl; got != tt.wantTTL {
+				t.Fatalf("ttl = %d, want %d", got, tt.wantTTL)
 			}
 		})
 	}

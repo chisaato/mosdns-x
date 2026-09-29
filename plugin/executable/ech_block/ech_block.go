@@ -60,6 +60,9 @@ type Args struct {
 	AllowDomains            []string `yaml:"allow_domains"`
 	CacheSize               int      `yaml:"cache_size"`
 	CacheTTL                int      `yaml:"cache_ttl"`
+	// MaxPassTTL caps the ttl of a TYPE65 response that passed the probe
+	// (not blocked, or probe failed). 0 means CacheTTL, < 0 disables it.
+	MaxPassTTL int `yaml:"max_pass_ttl"`
 }
 
 type probeCacheEntry struct {
@@ -94,7 +97,7 @@ func newEchBlock(bp *coremain.BP, args *Args) (*echBlock, error) {
 		return nil, fmt.Errorf("unsupported block_mode: %s", args.BlockMode)
 	}
 	if args.BlockMode == "" {
-		args.BlockMode = "refused"
+		args.BlockMode = "empty"
 	}
 
 	timeout := time.Duration(args.ProbeTimeout) * time.Millisecond
@@ -108,6 +111,9 @@ func newEchBlock(bp *coremain.BP, args *Args) (*echBlock, error) {
 	}
 	if args.CacheTTL <= 0 {
 		args.CacheTTL = 30
+	}
+	if args.MaxPassTTL == 0 {
+		args.MaxPassTTL = args.CacheTTL
 	}
 
 	probeAddr := args.ProbeDNS
@@ -205,11 +211,11 @@ func (b *echBlock) Exec(ctx context.Context, qCtx *query_context.Context, next e
 			zap.String("probe_dns", b.args.ProbeDNS),
 			zap.Error(err),
 		)
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+		return b.passThrough(ctx, qCtx, next)
 	}
 
 	if !blocked {
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+		return b.passThrough(ctx, qCtx, next)
 	}
 
 	b.L().Info(
@@ -219,6 +225,21 @@ func (b *echBlock) Exec(ctx context.Context, qCtx *query_context.Context, next e
 	)
 	b.block(qCtx)
 	return nil
+}
+
+// passThrough hands a probed TYPE65 query over to the next node and caps the
+// ttl of the response at MaxPassTTL.
+//
+// The pass verdict only holds until the probe is redone, so the upstream
+// HTTPS record (possibly carrying ECH) must not outlive it. Otherwise, once
+// the domain gets hijacked, the client could keep the ECH config cached next
+// to the fresh hijacked A/AAAA record and fail the handshake.
+func (b *echBlock) passThrough(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+	err := executable_seq.ExecChainNode(ctx, qCtx, next)
+	if r := qCtx.R(); r != nil && b.args.MaxPassTTL > 0 {
+		dnsutils.ApplyMaximumTTL(r, uint32(b.args.MaxPassTTL))
+	}
+	return err
 }
 
 func (b *echBlock) lookup(qName string) (bool, error) {

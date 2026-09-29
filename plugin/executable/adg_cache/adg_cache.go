@@ -48,7 +48,8 @@ type Args struct {
 	// Optimistic controls whether expired cache is served when still within
 	// StaleTTL.  Default true (serve expired but with OptimisticTTL-adjusted
 	// TTL so the client doesn't cache our stale value too long).
-	Optimistic bool `yaml:"optimistic"`
+	// A pointer so that an explicit false can be told apart from unset.
+	Optimistic *bool `yaml:"optimistic"`
 }
 
 type adgCachePlugin struct {
@@ -79,8 +80,9 @@ func newAdgCachePlugin(bp *coremain.BP, args *Args) (*adgCachePlugin, error) {
 		args.OptimisticTTL = defaultOptimisticTTL
 	}
 	// Default to optimistic (serve stale).
-	if !args.Optimistic && args.StaleTTL > 0 {
-		args.Optimistic = true
+	if args.Optimistic == nil {
+		optimistic := true
+		args.Optimistic = &optimistic
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -138,7 +140,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		expiredSec := now - expiry
 
 		// If optimistic is on and still within StaleTTL, serve stale.
-		if f.args.Optimistic && expiredSec <= uint32(f.args.StaleTTL) {
+		if *f.args.Optimistic && expiredSec <= uint32(f.args.StaleTTL) {
 			dnsutils.SetTTL(msg, uint32(f.args.OptimisticTTL))
 			msg.Id = q.Id
 			qCtx.SetResponse(msg)

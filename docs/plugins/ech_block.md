@@ -45,12 +45,15 @@ plugins:
       # 跳过 TLS 证书校验（仅对 DoT/DoH/DoQ 有效）
       probe_insecure_skip_verify: false
 
-      # 阻断方式，默认 refused
-      block_mode: "refused"
+      # 阻断方式，默认 empty（空 NOERROR）
+      block_mode: "empty"
 
       # 探测结果 LRU 缓存
       cache_size: 10000
       cache_ttl: 60
+
+      # 放行时 TYPE65 应答的最大 TTL（秒），默认等于 cache_ttl，负数关闭
+      max_pass_ttl: 60
 
       # 白名单域名
       allow_domains:
@@ -65,9 +68,10 @@ plugins:
 | `probe_timeout` | `int` | 否 | 500 | 探测超时（毫秒） |
 | `probe_bootstrap` | `[]string` | 否 | 无 | 纯 IP DNS 地址列表，用于解析 `probe_dns` 中的域名。`probe_dns` 是纯 IP 时无效 |
 | `probe_insecure_skip_verify` | `bool` | 否 | false | 跳过 TLS 证书校验 |
-| `block_mode` | `string` | 否 | `refused` | 阻断方式：`refused` / `nxdomain` / `empty` |
+| `block_mode` | `string` | 否 | `empty` | 阻断方式：`empty` / `refused` / `nxdomain`，见下方说明 |
 | `cache_size` | `int` | 否 | 10000 | 探测结果 LRU 缓存容量 |
 | `cache_ttl` | `int` | 否 | 30 | 缓存秒数 |
+| `max_pass_ttl` | `int` | 否 | = `cache_ttl` | 放行（未劫持/探测失败）时 TYPE65 应答的 TTL 上限；负数关闭 |
 | `allow_domains` | `[]string` | 否 | 无 | 白名单域名，支持 `provider:` 引用 |
 
 ## 支持的协议
@@ -101,12 +105,26 @@ TYPE65 查询进入 ech_block
       │
       ├─ 探测失败 → 放行（失败安全，宁可漏不可误杀）
       │
-      ├─ 任一族记录非空 → 阻断（返回 REFUSED / NXDOMAIN / 空应答）
+      ├─ 任一族记录非空 → 阻断（默认空 NOERROR，可选 REFUSED / NXDOMAIN）
       │  并缓存结果
       │
       └─ 两族均无记录 → 透传（未被劫持）
          并缓存结果
 ```
+
+探测失败与未劫持两种放行，上游返回的 TYPE65 应答 TTL 会被压到 `max_pass_ttl`
+以内：放行结论只在下一次探测前有效，上游 HTTPS 记录（含 ECH）不能活得比它久。
+否则域名随后被劫持（服务部署进内网）时，客户端会拿着缓存里的 ECH 配置去连
+刚解析到的内网 IP，握手失败。
+
+### block_mode 的选择
+
+- `empty`（默认，推荐）：NOERROR + 空答案，客户端视为"该域名没有 HTTPS 记录"，
+  直接走 A/AAAA。
+- `refused`：部分 stub 会换下一个上游重试（可能拿到公网 ECH）；多节点链路中
+  上游节点返回 REFUSED 时，下游 `_response_noerror` 判定失败会穿透到本地公网，
+  同样导致 ECH 泄漏。
+- `nxdomain`：宣告整个域名不存在，部分客户端会连带放弃 A/AAAA，不建议使用。
 
 ## 典型用法
 
@@ -120,7 +138,6 @@ plugins:
     type: ech_block
     args:
       probe_dns: "10.96.0.10:53"
-      block_mode: "refused"
       cache_size: 10000
       cache_ttl: 60
 
@@ -192,7 +209,6 @@ plugins:
     type: ech_block
     args:
       probe_dns: "10.96.0.10:53"
-      block_mode: "nxdomain"
 
   - tag: cf_over_https
     type: adg_forward

@@ -34,6 +34,7 @@ fork 专属代码应集中在新文件或新包中，避免修改上游已有文
 | `pkg/dnsutils/`, `pkg/matcher/msg_matcher/` 等 | 不修改，提取逻辑到 `pkg/matcher/macaddr/` 自有包中 |
 | `plugin/matcher/query_matcher/` | 不修改，拆分出独立 `mac_matcher` 插件 |
 | `plugin/enabled_plugin.go` | 仅添加 blank import（一目了然的单行） |
+| `plugin/executable/ecs/ecs.go` | 仅两处调用（非公网 ECS 清洗），逻辑在 fork 自有的 `scrub.go` |
 
 ## 合并上游更改
 

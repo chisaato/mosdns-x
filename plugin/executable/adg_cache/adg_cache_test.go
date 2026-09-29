@@ -2,11 +2,14 @@ package adg_cache
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pmkol/mosdns-x/coremain"
@@ -80,6 +83,7 @@ func Test_adgCachePlugin_doRefresh_does_not_carry_stale_response_to_next_node(t 
 	defer cancel()
 
 	p := &adgCachePlugin{
+		metrics:     newCacheMetrics(),
 		prefetchCtx: prefetchCtx,
 	}
 
@@ -257,4 +261,62 @@ func Test_adgCachePlugin_prefetch_before_expiry(t *testing.T) {
 			waitCall(t, next.calls, tt.wantCall)
 		})
 	}
+}
+
+func Test_adgCachePlugin_metrics(t *testing.T) {
+	p := newTestCache(t, &Args{})
+	next := upstreamStub{ip: net.IPv4(198, 51, 100, 1), ttl: 300, calls: make(chan struct{}, 4)}
+
+	fresh := new(dns.Msg)
+	fresh.SetQuestion("fresh.example.", dns.TypeA)
+	seedEntry(t, p, fresh, 300, 100)
+	stale := new(dns.Msg)
+	stale.SetQuestion("stale.example.", dns.TypeA)
+	seedEntry(t, p, stale, 300, -5)
+	miss := new(dns.Msg)
+	miss.SetQuestion("miss.example.", dns.TypeA)
+
+	execCache(t, p, fresh, next)
+	execCache(t, p, stale, next)
+	waitCall(t, next.calls, true) // stale refresh
+	execCache(t, p, miss, next)
+	waitCall(t, next.calls, true)
+
+	m := p.metrics
+	require.EqualValues(t, 3, counterValue(t, m.queryTotal))
+	require.EqualValues(t, 1, counterValue(t, m.hitTotal))
+	require.EqualValues(t, 1, counterValue(t, m.staleHitTotal))
+	require.EqualValues(t, 1, counterValue(t, m.refreshTotal))
+}
+
+func Test_adgCachePlugin_onEvict_counts_live_entries(t *testing.T) {
+	p := newTestCache(t, &Args{StaleTTL: 300})
+	now := time.Now().Unix()
+	val := func(expiresIn int64) []byte { return packCacheValue(uint32(now+expiresIn), []byte{0}) }
+
+	p.onEvict(nil, val(100))  // fresh
+	p.onEvict(nil, val(-100)) // stale but servable
+	p.onEvict(nil, val(-400)) // past stale_ttl, dead weight
+
+	require.EqualValues(t, 3, counterValue(t, p.metrics.evictedTotal))
+	require.EqualValues(t, 2, counterValue(t, p.metrics.evictedLiveTotal))
+}
+
+func Test_adgCachePlugin_lru_eviction_calls_onEvict(t *testing.T) {
+	p := newTestCache(t, &Args{Size: 1024})
+	for i := 0; i < 20; i++ {
+		q := new(dns.Msg)
+		q.SetQuestion(fmt.Sprintf("host%d.example.", i), dns.TypeA)
+		seedEntry(t, p, q, 300, 100)
+	}
+	require.Positive(t, counterValue(t, p.metrics.evictedTotal))
+	require.Equal(t, counterValue(t, p.metrics.evictedTotal), counterValue(t, p.metrics.evictedLiveTotal))
+	require.LessOrEqual(t, p.items.Stats().Size, 1024)
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	return m.GetCounter().GetValue()
 }

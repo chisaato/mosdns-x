@@ -62,6 +62,7 @@ type adgCachePlugin struct {
 	args *Args
 
 	items          glcache.Cache
+	metrics        *cacheMetrics
 	prefetchSF     singleflight.Group
 	prefetchCtx    context.Context
 	prefetchCancel context.CancelFunc
@@ -96,14 +97,20 @@ func newAdgCachePlugin(bp *coremain.BP, args *Args) (*adgCachePlugin, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &adgCachePlugin{
-		BP:   bp,
-		args: args,
-		items: glcache.New(glcache.Config{
-			MaxSize:   uint(args.Size),
-			EnableLRU: true,
-		}),
+		BP:             bp,
+		args:           args,
+		metrics:        newCacheMetrics(),
 		prefetchCtx:    ctx,
 		prefetchCancel: cancel,
+	}
+	p.items = glcache.New(glcache.Config{
+		MaxSize:   uint(args.Size),
+		EnableLRU: true,
+		OnDelete:  p.onEvict,
+	})
+	if err := p.registerMetrics(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("adg_cache: register metrics: %w", err)
 	}
 	return p, nil
 }
@@ -121,6 +128,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
+	f.metrics.queryTotal.Inc()
 	cached := f.items.Get([]byte(key))
 	if cached != nil {
 		msg, expiry, err := unpackCacheValue(cached)
@@ -141,6 +149,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 			}
 			msg.Id = q.Id
 			qCtx.SetResponse(msg)
+			f.metrics.hitTotal.Inc()
 			f.L().Debug("adg_cache: fresh hit", qCtx.InfoField())
 
 			// Prefetch: refresh a hit entry shortly before it expires, so
@@ -159,6 +168,7 @@ func (f *adgCachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, 
 			dnsutils.SetTTL(msg, uint32(f.args.OptimisticTTL))
 			msg.Id = q.Id
 			qCtx.SetResponse(msg)
+			f.metrics.staleHitTotal.Inc()
 			f.L().Debug("adg_cache: stale hit",
 				qCtx.InfoField(),
 				zap.Uint32("expired_sec", expiredSec),
@@ -207,11 +217,13 @@ func (f *adgCachePlugin) doRefresh(key string, qCtx *query_context.Context, next
 		_, _, _ = f.prefetchSF.Do(key, func() (interface{}, error) {
 			pCtx, cancel := context.WithTimeout(f.prefetchCtx, defaultPrefetchTimeout)
 			defer cancel()
+			f.metrics.refreshTotal.Inc()
 
 			lazyQCtx := qCtx.Copy()
 			lazyQCtx.SetResponse(nil)
 			err := executable_seq.ExecChainNode(pCtx, lazyQCtx, next)
 			if err != nil {
+				f.metrics.refreshFailedTotal.Inc()
 				f.L().Debug("adg_cache: refresh failed", qCtx.InfoField(), zap.Error(err))
 				return nil, nil
 			}

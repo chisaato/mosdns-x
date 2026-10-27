@@ -1,30 +1,30 @@
 # 情境：中枢-边缘多节点架构
 
-> 多节点部署时的整体形态：119 为唯一数据源中枢，其余节点为哑路由边缘。
-> 各等级语义见 [README](./README.md)。
+> 多节点部署时的整体形态：中枢为唯一数据源，其余节点为哑路由边缘。
+> tag v2 语义见 [README](./README.md)。
 
 ## 角色划分
 
 | 角色 | 节点 | 职责 | 持有的数据 |
 |------|------|------|-----------|
-| 中枢 HUB | 119 | 按客户端 tag 裁决加速（pdns / 隧道拨测 / 公网回落），本地分流 | pdns + tunnel-hosts.txt（**全网唯一 IP 数据源**） |
-| 边缘 EDGE | 211 及未来节点 | 广告过滤 / 缓存 / 按路由表把候选域转发中枢 | accel-route-domains.txt（**只有域名，无 IP**） |
+| 中枢 HUB | 中枢节点 | 按客户端 tag 裁决加速（pdns / 隧道拨测 / 公网回落），本地分流 | pdns + tunnel-hosts.txt（**全网唯一 IP 数据源**） |
+| 边缘 EDGE | 各边缘节点 | 按 no-filter 决定广告过滤 / 缓存 / 按路由表把候选域转发中枢 | hub-route-domains.txt（**只有域名，无 IP**） |
 
 设计原则：**易漂移的 IP 数据不出中枢，边缘零加速状态**。新增边缘节点 =
 部署边缘配置 + 同步一份纯域名清单，不装 pdns、不复制隧道映射、不做拨测。
 
-## 等级如何跨节点传播：client_id path 透传
+## tag 如何跨节点传播：client_id path 透传
 
-客户端连边缘的 URL path 已经是 tag 集合（`/dns-query/accel/international` →
-`clientIDs = ["accel", "international"]`，段数不限、顺序无关，见
+客户端连边缘的 URL path 已经是 tag 集合（`/dns-query/outdoor/tunnel-cn` →
+`clientIDs = ["outdoor", "tunnel-cn"]`，段数不限、顺序无关，见
 [`doh-path.md`](../doh-path.md)）。边缘的 `adg_forward` 开启
 `client_id_passthrough` 后，把这套 tag **动态拼到出站 URL path**，中枢按同样
 语义裁决：
 
 ```
-客户端 → 边缘: /dns-query/accel/international
-边缘   → 中枢: https://hub:4215/dns-query/accel/international   ← tag 原样过境
-中枢:   tunnel_accelerate / pdns / outdoor / 兜底 各分支独立匹配
+客户端 → 边缘: /dns-query/outdoor/tunnel-cn
+边缘   → 中枢: https://hub.example.com:4215/dns-query/outdoor/tunnel-cn   ← tag 原样过境
+中枢:   无 outdoor → pdns；outdoor + tunnel-cn → 隧道；仅 outdoor → 公网
 ```
 
 选型记录：节点间身份通道最终为**双通道并存**——
@@ -43,42 +43,42 @@ path 则一端开关即可——因此 DoH 链路以 path 为主，EDNS 兜住�
 
 ```mermaid
 flowchart TD
-    C["客户端<br/>path 携带 tag"] --> E["边缘: hosts → ecs<br/>adg_filter → adg_cache"]
-    E --> R{"match_accel_route<br/>(纯域名路由表)"}
+    C["客户端<br/>path 携带 tag"] --> E["边缘: ecs<br/>按 no-filter 决定过滤 → adg_cache"]
+    E --> R{"match_hub_route<br/>(纯域名路由表)"}
     R -->|"命中"| H["adg_forward hub<br/>client_id_passthrough: true"]
     R -->|"未命中"| L["本地 split_forward<br/>cn / 海外"]
     H -->|"NOERROR → _return"| X["应答"]
     H -->|"超时/不可达 → 穿透"| L2["本地 split_forward<br/>(加速域降级 CF, 服务不断)"]
-    H --> T["中枢 119 按原有分支裁决:<br/>international → 公网<br/>accel → tunnel_accelerate 拨测<br/>无tag+内网域 → pdns<br/>兜底 → 公网"]
+    H --> T["中枢按 tag v2 裁决:<br/>无 outdoor → pdns，查不到回落公网<br/>outdoor + tunnel-cn → 拨测，失败回落公网<br/>仅 outdoor → 公网（保留 ECH）<br/>单独 tunnel-cn 忽略"]
 ```
 
 ## 边缘配置要点（完整样例见部署配置）
 
 ```yaml
 data_providers:
-  - tag: accel_route                     # 纯域名路由表（119 生成并分发）
-    file: /etc/mosdns/accel-route-domains.txt
+  - tag: hub_route                       # 纯域名路由表（中枢生成并分发）
+    file: /etc/mosdns/hub-route-domains.txt
     auto_reload: true
 
 plugins:
-  - tag: match_accel_route
+  - tag: match_hub_route
     type: query_matcher
     args:
-      domain: ["provider:accel_route"]
+      domain: ["provider:hub_route"]
 
   - tag: hub                             # 中枢上游：tag 动态透传
     type: adg_forward
     args:
       client_id_passthrough: true
       upstream:
-        - addr: "https://hub.example:4215/dns-query"
-      bootstrap: ["https://223.5.5.5/dns-query"]
+        - addr: "https://hub.example.com:4215/dns-query"
+      bootstrap: ["https://192.0.2.53/dns-query"] # 占位，部署时替换
       timeout: 10
 ```
 
 ```yaml
 # default_sequence（cache 之后）
-- if: match_accel_route
+- if: match_hub_route
   exec:
     - hub
     - if: "[_response_noerror]"   # 中枢应答（含空抑制/回落结果）→ 结束
@@ -91,34 +91,34 @@ plugins:
 
 ```yaml
 plugins:
-  - tag: cap_accel_ttl
+  - tag: cap_route_ttl
     type: ttl
     args:
       maximum_ttl: 30             # 与中枢 tunnel_accelerate 的 ttl 一致
 
 # default_sequence（本地 split_forward 之后）
 - split_forward
-- if: match_accel_route
-  exec: [cap_accel_ttl]
+- if: match_hub_route
+  exec: [cap_route_ttl]
 ```
 
 边缘**不需要**：`tunnel_accelerate`、`ech_block`、`forward_pdns`、
 `_response_noerror` 之外的中枢插件——加速逻辑全部集中在中枢。
 
-## 新增等级的流程（以 international 为例）
+## tag 组合的下发（以 no-filter 为例）
 
-1. 中枢 sequence 顶部加一个分支（`match_client_international → split_forward`）
-2. 给目标人群分发 `/dns-query/international` 或组合 path（如
-   `/dns-query/accel/international` 由中枢分支优先级决定实际策略）
-3. **边缘节点零改动**——tag 经透传自动到达中枢
+1. 各节点用 `client_id: [no-filter]` 定义匹配器，广告过滤加否定条件
+2. 按需分发 `/dns-query/outdoor/no-filter` 或
+   `/dns-query/outdoor/tunnel-cn/no-filter`，只跳过广告过滤，不改变解析路线
+3. **边缘转发零改动**——tag 经透传自动到达中枢，组合无需枚举上游
 
-## 路由表生成（119 的 ofelia/update.sh 追加）
+## 路由表生成（中枢定时更新任务）
 
 ```sh
-cat internal_accelerate-domains.txt > accel-route-domains.txt
-awk '{print $1}' tunnel-hosts.txt | grep -v '^#' >> accel-route-domains.txt
-sort -u accel-route-domains.txt -o accel-route-domains.txt
-# 分发到各边缘 /etc/mosdns/accel-route-domains.txt
+cat internal_accelerate-domains.txt > hub-route-domains.txt
+awk '{print $1}' tunnel-hosts.txt | grep -v '^#' >> hub-route-domains.txt
+sort -u hub-route-domains.txt -o hub-route-domains.txt
+# 分发到各边缘 /etc/mosdns/hub-route-domains.txt
 ```
 
 ## 边界行为
@@ -128,4 +128,4 @@ sort -u accel-route-domains.txt -o accel-route-domains.txt
 | 中枢不可达 | 边缘穿透本地 split_forward，加速域降级 CF，服务不断 |
 | 路由表条目在中枢已失效 | 中枢走自己兜底返回公网结果，边缘无感知 |
 | 新增隧道/内网域名 | 只更新中枢数据 + 重生成路由表，边缘 auto_reload 生效 |
-| 客户端多 tag 组合 | 集合语义，各分支独立匹配，无需枚举组合 |
+| 客户端多 tag 组合 | 集合语义；隧道须同时含 outdoor + tunnel-cn，no-filter 独立控制过滤 |

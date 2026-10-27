@@ -1,22 +1,22 @@
-# 情境：国内隧道加速（accel）
+# 情境：国内隧道加速（outdoor + tunnel-cn）
 
-> 适用客户端：`/dns-query/accel`（client_id `accel`，别名 `tunnel-cn`）。
+> 适用客户端：`/dns-query/outdoor/tunnel-cn`（两个 client_id 必须同时出现）。
 > 统一模型与分族语义见 [README](./README.md)。
 
 ## 场景
 
-服务部署在国内机器的内网穿透上，同时保有 Cloudflare 副本供海外/有梯子用户，
+服务部署在国内机器的内网穿透上，同时保有公网入口供不使用隧道的出门设备，
 同名 split-horizon：
 
-- accel 客户端 → 解析到隧道入口 IP（加速）
-- outdoor 客户端 → 解析到 Cloudflare（ECH 完整）
+- outdoor + tunnel-cn 客户端 → 解析到隧道入口 IP（加速）
+- 仅 outdoor 客户端 → 公网解析（ECH 等记录完整）；仅 tunnel-cn 不启用隧道
 
 与内网加速不同，隧道入口没有权威 DNS 服务器，**端点健康（TCP 拨测）就是 gate**：
 隧道挂掉时自动整域回落公网，恢复后自动切回。
 
 ## 配置
 
-加速地址以 hosts 文件外部维护（可远程同步，如走 ofelia/update.sh）：
+加速地址以 hosts 文件外部维护（可通过定时任务远程同步）：
 
 ```yaml
 data_providers:
@@ -39,8 +39,8 @@ plugins:
 `tunnel-hosts.txt`（hosts 格式，一行一个完整域名，可混合 v4/v6）：
 
 ```
-gitlab.example.com 1.2.3.4
-app.example.com 5.6.7.8 2408:aaaa::1
+service.example.com 192.0.2.10
+app.example.com 198.51.100.10 2001:db8::1
 ```
 
 完整参数说明见 [`docs/plugins/tunnel_accelerate.md`](../plugins/tunnel_accelerate.md)。
@@ -68,25 +68,28 @@ app.example.com 5.6.7.8 2408:aaaa::1
 
 ```yaml
 exec:
-  - if: match_client_accel          # client_matcher, client_id: [accel, tunnel-cn]
+  # 先按 no-filter 决定是否执行广告过滤
+  - if: "match_client_outdoor && match_client_tunnel_cn"
     exec:
       - tunnel_accelerate           # 命中并接管 → 结束；全死 → 穿透
+      - split_forward               # 回落必须在同一分支内，供插件压短 TTL
+      - _return
   - if: match_client_outdoor
     exec: [split_forward, _return]  # 终结分支
-  # ... 无 tag 现有链路
+  # ... 无 outdoor 的内网权威链路
 ```
 
-accel 客户端查询未登记域名 → 不命中 hosts → 穿透走后续公网分流，零额外配置。
+两个 matcher 分别匹配 `client_id: [outdoor]` 和 `[tunnel-cn]`；也可用
+`client_id: [outdoor, tunnel-cn]` 配合 `match_all: true`，不可用默认 ANY。
+查询未登记域名 → 不命中 hosts → 穿透走同分支的公网分流，零额外配置。
 
 > **`_return` 的作用域**：mosdns 的 `if` 分支执行完会继续走外层后续节点；
 > `_return` 写在 `split_forward` 这类子 sequence 内部也只退出子 sequence，外层
 > 仍会继续。因此需要终结的分支（如 outdoor）要在**顶层分支里**写 `_return`，
 > 否则 outdoor 应答会被后续 ech_block / forward_pdns 覆盖。
 >
-> accel 穿透则是有意继续：回落会依次经过 adg_filter / adg_cache 和无 tag 链路。
-> 注意这包括 pdns 内网加速分支——同时登记在隧道与 pdns 的域名，隧道全挂时 accel
-> 客户端会拿到内网 IP。若 accel 客户端不在内网，给该分支加条件排除 accel：
-> `if: "match_internal_accelerate && !match_client_accel"`。
+> 隧道回落只走公网，不能串入 pdns 内网加速；`split_forward` 放在插件后，
+> 使插件能在回落应答后压短 TTL。过滤是否跳过只由 `no-filter` 决定。
 
 > **与 adg_cache 乐观缓存的配合**：adg_cache 对缓存 TTL ≤ `stale_min_ttl`
 > （默认 = `optimistic_ttl` = 30）的条目不做过期响应，加速应答与回落应答（TTL
@@ -95,7 +98,7 @@ accel 客户端查询未登记域名 → 不命中 hosts → 穿透走后续公�
 
 ## 客户端接入 **[待补充]**
 
-- [ ] accel 客户端的具体形态（哪些设备/软路由、如何下发 `/dns-query/accel` 配置）
+- [ ] 出门客户端的具体形态（设备/软路由、如何下发 `/dns-query/outdoor/tunnel-cn`）
 - [ ] 隧道服务清单与端口（哪些域名进 tunnel-hosts.txt、非 443 端口列表）
 
 ## 边界行为

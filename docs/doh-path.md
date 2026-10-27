@@ -76,19 +76,19 @@ plugins:
   - tag: forward_family
     type: forward
     args:
-      upstream: "https://dns-family.example/dns-query"
+      upstream: "https://family.example.com/dns-query"
 
   # 客户端 B 的上游
   - tag: forward_adult
     type: forward
     args:
-      upstream: "https://dns-adult-filter.example/dns-query"
+      upstream: "https://adult.example.com/dns-query"
 
   # 默认上游
   - tag: forward_default
     type: forward
     args:
-      upstream: "https://dns-public.example/dns-query"
+      upstream: "https://public.example.com/dns-query"
 
   # 主执行链：按 clientID 分流
   - tag: main_seq
@@ -183,10 +183,12 @@ plugins:
 同样语义路由：
 
 ```
-客户端 → 边缘: /dns-query/accel/international
-边缘   → 中枢: https://hub:4215/dns-query/accel/international
+客户端 → 边缘: /dns-query/outdoor/tunnel-cn
+边缘   → 中枢: https://hub.example.com:4215/dns-query/outdoor/tunnel-cn
 ```
 
-tag 集合任意组合、顺序无关，无需为组合枚举上游；详见
+tag v2 中 `outdoor` 表示出门，`tunnel-cn` 仅与它同时出现才启用国内隧道；
+单独 `tunnel-cn` 忽略。`no-filter` 只跳过广告过滤。策略由 sequence 配置，
+不是插件内置规则。tag 集合任意组合、顺序无关，无需为组合枚举上游；详见
 [`adg_forward`](./plugins/adg_forward.md#client_id-透传多节点转发) 与
 [`scenarios/hub-edge.md`](./scenarios/hub-edge.md)。

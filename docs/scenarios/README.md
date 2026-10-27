@@ -6,20 +6,23 @@
 ## 全景
 
 一台公网 DNS 服务器同时服务三类客户端，按 DoH/DoQ URL path 中的
-client_id 区分（机制见 [`docs/doh-path.md`](../doh-path.md)）：
+tag 经 `client_matcher` 的 `client_id` 区分（机制见 [`docs/doh-path.md`](../doh-path.md)）：
 
 | 客户端 | 请求 path | 身份 | 加速策略 | 情境文档 |
 |--------|-----------|------|----------|----------|
-| 内网/国内设备 | `/dns-query` | 无 tag | pdns 内网加速（K3S 服务） | [internal-accelerate](./internal-accelerate.md) |
-| 隧道加速客户端 | `/dns-query/accel` | `accel` | 国内隧道（拨测 gate + hosts 应答） | [tunnel-accelerate](./tunnel-accelerate.md) |
-| 海外/有梯子设备 | `/dns-query/outdoor` | `outdoor` | 直接公网（Cloudflare，ECH 完整） | [outdoor](./outdoor.md) |
-| 多节点部署 | — | 中枢/边缘分层 | 等级跨节点传播与数据源收敛 | [hub-edge](./hub-edge.md) |
+| 在家设备 | `/dns-query` | 无 `outdoor` | pdns 内网加速（K3S 服务） | [internal-accelerate](./internal-accelerate.md) |
+| 出门且需国内隧道 | `/dns-query/outdoor/tunnel-cn` | `outdoor` + `tunnel-cn` | 国内隧道（拨测 gate + hosts 应答） | [tunnel-accelerate](./tunnel-accelerate.md) |
+| 出门设备 | `/dns-query/outdoor` | `outdoor` | 直接公网（ECH 等记录完整） | [outdoor](./outdoor.md) |
+| 多节点部署 | — | 中枢/边缘分层 | tag 跨节点传播与数据源收敛 | [hub-edge](./hub-edge.md) |
+
+tag v2 中 `outdoor` 表示不在家；`tunnel-cn` 仅与它同时出现才生效，单独出现忽略。
+`no-filter` 独立控制跳过广告过滤，不改变解析路线；旧 tag 已废弃。
 
 服务器组件：
 
 ```
 客户端 ──DoH/DoQ :4215 (dns.example.com)──▶ mosdns
-                                            ├─▶ pdns-auth 127.0.0.1:2653
+                                            ├─▶ pdns-auth 192.0.2.53:2653
                                             │     ▲ RFC2136 DNS Update
                                             │     └─ K3S external-dns（多集群多 owner）
                                             ├─▶ 国内 DoH（cn 分流）
@@ -36,7 +39,7 @@ client_id 区分（机制见 [`docs/doh-path.md`](../doh-path.md)）：
 
 两条加速链路（pdns 内网加速 / 国内隧道）共享同一语义框架：
 
-| | 内网加速（无 tag） | 隧道加速（accel） |
+| | 内网加速（无 outdoor） | 隧道加速（outdoor + tunnel-cn） |
 |---|---|---|
 | gate | pdns 记录存在性 | 隧道端点 TCP 拨测存活 |
 | 答案源 | forward_pdns | hosts 文件静态映射 |
@@ -66,8 +69,8 @@ ECH（TYPE65）的阻断与 A/AAAA 使用**同一个 gate**：任一族存活即
 |------|------|------|
 | 单栈 K8S 只推 A | AAAA 返回空 NOERROR，客户端只用内网 v4；公网 v6 不泄漏 | [internal-accelerate](./internal-accelerate.md) |
 | 单栈隧道（hosts 只配 v4） | 同上对称 | [tunnel-accelerate](./tunnel-accelerate.md) |
-| 隧道端点全挂 | accel 客户端整域回落 Cloudflare；恢复后约 2 分钟自动切回 | [tunnel-accelerate](./tunnel-accelerate.md) |
-| pdns 中服务已删（NXDOMAIN） | 无 tag 客户端回落公网，走 Cloudflare | [internal-accelerate](./internal-accelerate.md) |
+| 隧道端点全挂 | outdoor + tunnel-cn 客户端整域回落公网；恢复后约 2 分钟自动切回 | [tunnel-accelerate](./tunnel-accelerate.md) |
+| pdns 中服务已删（NXDOMAIN） | 无 outdoor 客户端回落公网 | [internal-accelerate](./internal-accelerate.md) |
 | pdns 孤儿 TXT（无地址记录） | 不构成 gate，正常回落公网 | [internal-accelerate](./internal-accelerate.md) |
 | v6-only 集群 | ech_block 双族探测照常阻断 ECH | [internal-accelerate](./internal-accelerate.md) |
 

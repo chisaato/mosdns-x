@@ -81,8 +81,8 @@ plugins:
 动态拼接到 upstream URL 的 path 后（见 [`doh-path.md`](../doh-path.md)）：
 
 ```
-客户端 → 边缘: /dns-query/accel/international     (clientIDs = [accel, international])
-边缘   → 中枢: https://hub:4215/dns-query/accel/international
+客户端 → 边缘: /dns-query/outdoor/tunnel-cn     (clientIDs = [outdoor, tunnel-cn])
+边缘   → 中枢: https://hub:4215/dns-query/outdoor/tunnel-cn
 ```
 
 - **顺序无关**：缓存 key 按 client_id 排序后生成，`/a/b` 与 `/b/a` 复用同一组 upstream

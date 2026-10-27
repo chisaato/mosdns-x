@@ -1,6 +1,6 @@
-# 情境：内网加速（无 tag）
+# 情境：内网加速（无 outdoor）
 
-> 适用客户端：`/dns-query`（无 client_id tag）的内网/国内设备。
+> 适用客户端：`/dns-query` 等未携带 `outdoor` 的在家设备；单独 `tunnel-cn` 忽略。
 > 统一模型与分族语义见 [README](./README.md)。
 
 ## 场景
@@ -9,7 +9,7 @@
 K3S external-dns 将服务记录写入 pdns（RFC2136 DNS Update），**pdns 记录存在性 =
 "服务已在内网部署"的真理来源**：
 
-- 服务部署 → 记录出现 → 无 tag 客户端解析到内网 IP
+- 服务部署 → 记录出现 → 无 outdoor 客户端解析到内网 IP
 - 服务删除 → external-dns 清理记录 → 自动回落公网（Cloudflare）
 
 ## 流程
@@ -36,18 +36,18 @@ K3S external-dns 将服务记录写入 pdns（RFC2136 DNS Update），**pdns 记
   Cloudflare ECH 配置最多残留一个 `cache_ttl`，不会拿着它去连新出现的内网 IP。
 - ech_block 使用**双族探测**（A+AAAA 任一存在即阻断）：v6-only 集群只登记 AAAA
   时旧版只探 A 会漏判，导致客户端拿到 Cloudflare 的 ECH 公钥去连内网 IP 而握手失败。
-- pdns 库中存在仅有 `a-`/`aaaa-` TXT 而无地址记录的孤儿条目（如 minio 相关记录），
+- pdns 库中存在仅有 `a-`/`aaaa-` TXT 而无地址记录的孤儿条目（如已删除服务的记录），
   gate 判定以实际 A/AAAA 存在性为准，孤儿 TXT 不构成 gate。
 
 ## 配置要点（sequence 片段）
 
 ```yaml
 exec:
-  # ... hosts → ecs → adg_filter → adg_cache
-  - if: match_internal_accelerate
+  # ... hosts → ecs → 按 no-filter 决定是否 adg_filter → adg_cache
+  - if: "match_internal_accelerate && !match_client_outdoor"
     exec:
       - block_internal_accelerate_domain_ecs   # ech_block, block_mode: empty
-      - forward_pdns                            # 127.0.0.1:2653
+      - forward_pdns                            # 192.0.2.53:2653（占位）
       - if: _response_noerror                   # NOERROR（含空答案）
         exec: [_return]
       # NXDOMAIN → 穿透到下面的 split_forward

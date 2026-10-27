@@ -73,6 +73,10 @@ type Args struct {
 	ProbeCacheSize int `yaml:"probe_cache_size"`
 	// ProbeCacheTTL is the probe result cache ttl in seconds. Default 60.
 	ProbeCacheTTL int `yaml:"probe_cache_ttl"`
+	// IPv6FollowIPv4 skips dialing ipv6 endpoints and treats them as alive
+	// when any ipv4 endpoint of the same entry is alive. Use it on resolvers
+	// that have no ipv6 egress, where ipv6 dials can never succeed.
+	IPv6FollowIPv4 bool `yaml:"ipv6_follow_ipv4"`
 }
 
 type probeCacheEntry struct {
@@ -301,6 +305,15 @@ func (t *tunnelAccelerate) decideAddrFamily(fqdn string, alivePrimary, aliveSeco
 // probeEntry probes all ipv4 and ipv6 endpoints of fqdn concurrently and
 // returns the alive ones of each family, in their original order.
 func (t *tunnelAccelerate) probeEntry(ctx context.Context, fqdn string, ipv4, ipv6 []netip.Addr) (alive4, alive6 []netip.Addr) {
+	// Resolver without ipv6 egress: never dial ipv6, they follow the ipv4 verdict.
+	if t.args.IPv6FollowIPv4 && len(ipv4) > 0 && len(ipv6) > 0 {
+		alive4, _ = t.probeEntry(ctx, fqdn, ipv4, nil)
+		if len(alive4) > 0 {
+			alive6 = ipv6
+		}
+		return alive4, alive6
+	}
+
 	all := make([]netip.Addr, 0, len(ipv4)+len(ipv6))
 	all = append(all, ipv4...)
 	all = append(all, ipv6...)

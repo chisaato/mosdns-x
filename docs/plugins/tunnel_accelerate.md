@@ -67,6 +67,7 @@ app.example.com 5.6.7.8 2408:aaaa::1
 | `probe_timeout` | `int` | 否 | 1 | 单次拨测超时（秒） |
 | `probe_cache_size` | `int` | 否 | 1024 | 拨测结果 LRU 缓存容量 |
 | `probe_cache_ttl` | `int` | 否 | 60 | 拨测结果缓存秒数 |
+| `ipv6_follow_ipv4` | `bool` | 否 | false | 不拨测 IPv6 端点，同一条目只要有 IPv4 端点存活就视为 IPv6 也存活。用于没有 IPv6 出口的解析器（对 v6 的拨测永远失败，会导致只返回 IPv4）。条目没有 IPv4 端点时仍按正常方式拨测 |
 
 ## 执行逻辑
 
@@ -116,22 +117,27 @@ app.example.com 5.6.7.8 2408:aaaa::1
 
 ```yaml
 plugins:
-  - tag: match_client_accel
+  - tag: match_client_outdoor
     type: client_matcher
     args:
-      client_id: ["accel", "tunnel-cn"]   # 支持别名
+      client_id: ["outdoor"]
+
+  - tag: match_client_tunnel_cn
+    type: client_matcher
+    args:
+      client_id: ["tunnel-cn"]
 
   - tag: tunnel_sequence
     type: sequence
     args:
       exec:
-        - if: match_client_accel
+        - if: "match_client_outdoor && match_client_tunnel_cn"   # tunnel-cn 仅与 outdoor 同时出现才生效
           exec:
             - exec: $tunnel_accelerate     # 命中并接管 → 结束；全死 → 穿透
         # ... 后续公网分流链路（穿透后会继续执行这里的所有节点）
 ```
 
-客户端请求 `/dns-query/accel` 即启用隧道加速；查询未登记域名时自然穿透走公网。
+客户端请求 `/dns-query/outdoor/tunnel-cn` 即启用隧道加速；查询未登记域名时自然穿透走公网。
 
 ## 注意事项
 

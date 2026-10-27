@@ -384,3 +384,42 @@ func Test_probeIP_singleflight(t *testing.T) {
 		t.Fatalf("dial called %d times, want 1", n)
 	}
 }
+
+func Test_probeEntry_IPv6FollowIPv4(t *testing.T) {
+	v4 := []netip.Addr{netip.MustParseAddr("1.1.1.1")}
+	v6 := []netip.Addr{netip.MustParseAddr("fd00::1")}
+
+	tests := []struct {
+		name      string
+		follow    bool
+		dead      []string
+		want4     int
+		want6     int
+		wantDial6 bool
+	}{
+		{name: "off: v6 dialed and dead", dead: []string{"fd00::1"}, want4: 1, want6: 0, wantDial6: true},
+		{name: "on: v6 follows alive v4 without dialing", follow: true, dead: []string{"fd00::1"}, want4: 1, want6: 1},
+		{name: "on: v4 dead then v6 dead too", follow: true, dead: []string{"1.1.1.1"}, want4: 0, want6: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newTestPlugin(t, "example.com. 1.1.1.1 fd00::1", tt.dead)
+			p.args.IPv6FollowIPv4 = tt.follow
+			var dialed6 atomic.Bool
+			inner := p.dialProbe
+			p.dialProbe = func(ctx context.Context, ip string, port int, d time.Duration) bool {
+				if strings.Contains(ip, ":") {
+					dialed6.Store(true)
+				}
+				return inner(ctx, ip, port, d)
+			}
+			a4, a6 := p.probeEntry(context.Background(), "example.com.", v4, v6)
+			if len(a4) != tt.want4 || len(a6) != tt.want6 {
+				t.Fatalf("alive4=%d alive6=%d, want %d/%d", len(a4), len(a6), tt.want4, tt.want6)
+			}
+			if dialed6.Load() != tt.wantDial6 {
+				t.Fatalf("dialed ipv6 = %v, want %v", dialed6.Load(), tt.wantDial6)
+			}
+		})
+	}
+}

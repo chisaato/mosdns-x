@@ -58,7 +58,8 @@ func (h *Hosts) LookupMsg(m *dns.Msg) *dns.Msg {
 	q := m.Question[0]
 	typ := q.Qtype
 	fqdn := q.Name
-	if q.Qclass != dns.ClassINET || (typ != dns.TypeA && typ != dns.TypeAAAA) {
+	// 命中 hosts 的域名对其全部地址类信息负责，拦截 HTTPS/SVCB 以免混搭公网 ECH/hint
+	if q.Qclass != dns.ClassINET || (typ != dns.TypeA && typ != dns.TypeAAAA && typ != dns.TypeHTTPS && typ != dns.TypeSVCB) {
 		return nil
 	}
 

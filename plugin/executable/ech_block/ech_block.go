@@ -57,6 +57,8 @@ type Args struct {
 	ProbeBootstrap          []string `yaml:"probe_bootstrap"`
 	ProbeInsecureSkipVerify bool     `yaml:"probe_insecure_skip_verify"`
 	BlockMode               string   `yaml:"block_mode"`
+	// OnProbeFail controls behavior when probe fails or times out ("pass" or "block").
+	OnProbeFail             string   `yaml:"on_probe_fail"`
 	AllowDomains            []string `yaml:"allow_domains"`
 	CacheSize               int      `yaml:"cache_size"`
 	CacheTTL                int      `yaml:"cache_ttl"`
@@ -98,6 +100,15 @@ func newEchBlock(bp *coremain.BP, args *Args) (*echBlock, error) {
 	}
 	if args.BlockMode == "" {
 		args.BlockMode = "empty"
+	}
+
+	switch args.OnProbeFail {
+	case "", "pass", "block":
+	default:
+		return nil, fmt.Errorf("unsupported on_probe_fail: %s", args.OnProbeFail)
+	}
+	if args.OnProbeFail == "" {
+		args.OnProbeFail = "pass"
 	}
 
 	timeout := time.Duration(args.ProbeTimeout) * time.Millisecond
@@ -205,6 +216,16 @@ func (b *echBlock) Exec(ctx context.Context, qCtx *query_context.Context, next e
 
 	blocked, err := b.lookup(qName)
 	if err != nil {
+		if b.args.OnProbeFail == "block" {
+			b.L().Warn(
+				"probe failed, block TYPE65",
+				zap.String("qname", qName),
+				zap.String("probe_dns", b.args.ProbeDNS),
+				zap.Error(err),
+			)
+			b.block(qCtx)
+			return nil
+		}
 		b.L().Warn(
 			"probe failed, pass through",
 			zap.String("qname", qName),
@@ -355,18 +376,14 @@ func (b *echBlock) block(qCtx *query_context.Context) {
 	case "nxdomain":
 		r := dnsutils.GenEmptyReply(q, dns.RcodeNameError)
 		qCtx.SetResponse(r)
-	case "empty":
-		r := new(dns.Msg)
-		r.SetRcode(q, dns.RcodeSuccess)
-		r.RecursionAvailable = true
-		qCtx.SetResponse(r)
 	default:
-		// 这才是安全的阻断 HTTPS/TYPE65 的方式
-		// 也就是用空响应和 RCODE=0 进行返回
-		// 不能用 nxdomain
+		// 用空响应 (RCODE=0) + FakeSOA 阻断 HTTPS/TYPE65，避免客户端退回 NXDOMAIN 且确保下游可缓存
 		r := new(dns.Msg)
 		r.SetRcode(q, dns.RcodeSuccess)
 		r.RecursionAvailable = true
+		if len(q.Question) > 0 {
+			r.Ns = []dns.RR{dnsutils.FakeSOA(q.Question[0].Name)}
+		}
 		qCtx.SetResponse(r)
 	}
 }

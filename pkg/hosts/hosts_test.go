@@ -56,16 +56,21 @@ func Test_hostsContainer_Match(t *testing.T) {
 		name        string
 		args        args
 		wantMatched bool
+		wantNil     bool
 		wantAddr    []string
 	}{
-		{"matched A", args{name: "dns.google.", typ: dns.TypeA}, true, []string{"8.8.8.8", "8.8.4.4"}},
-		{"matched AAAA", args{name: "dns.google.", typ: dns.TypeAAAA}, true, []string{"2001:4860:4860::8844", "2001:4860:4860::8888"}},
-		{"not matched A", args{name: "nxdomain.com.", typ: dns.TypeA}, false, nil},
-		{"not matched A", args{name: "sub.dns.google.", typ: dns.TypeA}, false, nil},
-		{"matched regexp A", args{name: "123456789.test.", typ: dns.TypeA}, true, []string{"192.168.1.1"}},
-		{"not matched regexp A", args{name: "0123456789.test.", typ: dns.TypeA}, false, nil},
-		{"test replacement", args{name: "test.com.", typ: dns.TypeA}, true, []string{"2.3.4.5"}},
-		{"test matched domain with mismatched type", args{name: "test.com.", typ: dns.TypeAAAA}, true, nil},
+		{"matched A", args{name: "dns.google.", typ: dns.TypeA}, true, false, []string{"8.8.8.8", "8.8.4.4"}},
+		{"matched AAAA", args{name: "dns.google.", typ: dns.TypeAAAA}, true, false, []string{"2001:4860:4860::8844", "2001:4860:4860::8888"}},
+		{"not matched A", args{name: "nxdomain.com.", typ: dns.TypeA}, false, false, nil},
+		{"not matched A", args{name: "sub.dns.google.", typ: dns.TypeA}, false, false, nil},
+		{"matched regexp A", args{name: "123456789.test.", typ: dns.TypeA}, true, false, []string{"192.168.1.1"}},
+		{"not matched regexp A", args{name: "0123456789.test.", typ: dns.TypeA}, false, false, nil},
+		{"test replacement", args{name: "test.com.", typ: dns.TypeA}, true, false, []string{"2.3.4.5"}},
+		{"test matched domain with mismatched type", args{name: "test.com.", typ: dns.TypeAAAA}, true, false, nil},
+		{"matched HTTPS returns empty NOERROR", args{name: "dns.google.", typ: dns.TypeHTTPS}, true, false, nil},
+		{"matched SVCB returns empty NOERROR", args{name: "dns.google.", typ: dns.TypeSVCB}, true, false, nil},
+		{"not matched HTTPS passes through", args{name: "nxdomain.com.", typ: dns.TypeHTTPS}, false, true, nil},
+		{"not matched SVCB passes through", args{name: "nxdomain.com.", typ: dns.TypeSVCB}, false, true, nil},
 	}
 	for _, tt := range tests {
 		q := new(dns.Msg)
@@ -73,8 +78,17 @@ func Test_hostsContainer_Match(t *testing.T) {
 
 		t.Run(tt.name, func(t *testing.T) {
 			r := h.LookupMsg(q)
+			if tt.wantNil {
+				if r != nil {
+					t.Fatalf("Lookup() = %v, want nil", r)
+				}
+				return
+			}
 			if tt.wantMatched && r == nil {
 				t.Fatal("Lookup() should not return a nil result")
+			}
+			if tt.wantMatched && len(tt.wantAddr) == 0 && (r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) == 0) {
+				t.Fatalf("want empty NOERROR with FakeSOA, got rcode=%d answer=%d ns=%d", r.Rcode, len(r.Answer), len(r.Ns))
 			}
 
 			for _, s := range tt.wantAddr {

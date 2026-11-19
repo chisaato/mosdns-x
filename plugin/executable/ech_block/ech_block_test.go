@@ -176,23 +176,26 @@ func TestExecDefaultsAndPassTTL(t *testing.T) {
 	qName := "example.com."
 
 	tests := []struct {
-		name       string
-		maxPassTTL int
-		up         *fakeUpstream
-		wantEmpty  bool   // 期望阻断为空 NOERROR
-		wantTTL    uint32 // 放行时期望的应答 TTL
+		name        string
+		maxPassTTL  int
+		onProbeFail string
+		up          *fakeUpstream
+		wantEmpty   bool   // 期望阻断为空 NOERROR
+		wantTTL     uint32 // 放行时期望的应答 TTL
 	}{
 		{name: "blocked, default empty NOERROR", up: &fakeUpstream{respByQtype: map[uint16][]dns.RR{dns.TypeA: {aRR(qName)}}}, wantEmpty: true},
 		{name: "not hijacked, ttl capped at cache_ttl", up: &fakeUpstream{}, wantTTL: 30},
 		{name: "probe failed, ttl capped at cache_ttl", up: &fakeUpstream{errByQtype: map[uint16]error{dns.TypeA: errors.New("timeout")}}, wantTTL: 30},
+		{name: "probe failed with fail-closed block", onProbeFail: "block", up: &fakeUpstream{errByQtype: map[uint16]error{dns.TypeA: errors.New("timeout")}}, wantEmpty: true},
 		{name: "cap disabled", maxPassTTL: -1, up: &fakeUpstream{}, wantTTL: 300},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b, err := newEchBlock(coremain.NewBP("test", PluginType, zap.NewNop(), nil), &Args{
-				ProbeDNS:   "127.0.0.1:53",
-				MaxPassTTL: tt.maxPassTTL,
+				ProbeDNS:    "127.0.0.1:53",
+				MaxPassTTL:  tt.maxPassTTL,
+				OnProbeFail: tt.onProbeFail,
 			})
 			if err != nil {
 				t.Fatalf("newEchBlock() error = %v", err)
@@ -211,8 +214,8 @@ func TestExecDefaultsAndPassTTL(t *testing.T) {
 				t.Fatal("expected a response, got nil")
 			}
 			if tt.wantEmpty {
-				if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 {
-					t.Fatalf("want empty NOERROR, got rcode %d with %d answers", r.Rcode, len(r.Answer))
+				if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) == 0 {
+					t.Fatalf("want empty NOERROR with FakeSOA, got rcode %d with %d answers and %d ns", r.Rcode, len(r.Answer), len(r.Ns))
 				}
 				return
 			}
